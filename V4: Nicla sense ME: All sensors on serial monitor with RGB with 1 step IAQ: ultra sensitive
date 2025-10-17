@@ -1,0 +1,337 @@
+/*
+  Nicla Sense ME — Max-Precision Standalone Readout
+  - Event-driven averaging with dataAvailable() guards
+  - High ODRs via BHY2.configure()
+  - IMU FSR tuning (acc/gyro setRange) for better quantization resolution
+  - Barometer precision: median-of-means (MoM) across multiple 1s windows
+  - RGB LED: BSEC warm-up colors, then IAQ 1-point granularity (0..500) with hysteresis
+  - BSEC payload: request long frames so comp_t/comp_h/comp_g are populated
+
+  Serial: 115200 baud
+*/
+
+// --- BSEC long-payload hint -----------------------------------------------
+// The SensorBSEC header notes: with the default 10-byte payload some fields
+// can be zero; increase SENSOR_DATA_FIXED_LENGTH to see all fields.
+// Define this *before* including Arduino_BHY2.h, and only if not already set.
+// (If your installed library already defines it, this guard prevents redefinition.)
+#ifndef SENSOR_DATA_FIXED_LENGTH
+#define SENSOR_DATA_FIXED_LENGTH 30
+#endif
+
+#include "Arduino.h"
+#include "Arduino_BHY2.h"
+#include "Nicla_System.h"     // LED helpers
+#include <math.h>             // roundf, fmodf, fabsf, sqrt, isnan
+
+// ======= Precision knobs (tune as needed) ===================================
+#define ODR_IMU_HZ           200   // accel/gyro/derived vectors (Hz)
+#define ODR_MAG_HZ            50   // magnetometer (Hz)
+#define ODR_ENV_HZ            25   // temp/hum/baro/gas (Hz)
+#define PRINT_INTERVAL_MS   1000   // averaging window size & print cadence
+
+// IMU full-scale ranges
+// IMPORTANT: per Arduino_BHY2 example, accel.setRange() expects a *code*.
+// Example: passing 2 selects ±4 g (not “4 g” literal). We'll use code=2 -> ±4 g.
+// Gyro takes the *actual dps* (e.g., 250, 500, 1000, 2000).
+#define ACC_RANGE_CODE         2   // selects ±4 g (per Standalone example semantics)
+#define GYRO_RANGE_DPS       250   // pick smallest safe FSR for your motion
+
+// Barometer median-of-means windowing (to approach sub-Pa stability)
+#define BARO_MOM_GROUPS        5   // number of 1s means kept for the MoM median
+
+// LED appearance (lower VAL reduces self-heating during precise T logging)
+constexpr float LED_SAT = 1.0f;
+constexpr float LED_VAL = 0.3f;    // dim to reduce thermal bias
+
+// IAQ LED hysteresis (points of IAQ change before updating color)
+constexpr uint8_t IAQ_HYSTERESIS_POINTS = 3;
+
+// ======= Sensor objects ======================================================
+SensorXYZ         acc (SENSOR_ID_ACC);       // m/s^2 (corrected)
+SensorXYZ         gyro(SENSOR_ID_GYRO);      // deg/s (corrected)
+SensorXYZ         mag (SENSOR_ID_MAG);       // µT   (corrected)
+SensorXYZ         lacc(SENSOR_ID_LACC);      // m/s^2 linear accel
+SensorXYZ         grav(SENSOR_ID_GRA);       // m/s^2 gravity vector
+SensorOrientation ori (SENSOR_ID_ORI);       // deg (Euler)
+SensorQuaternion  rv  (SENSOR_ID_RV);        // quaternion
+
+Sensor            temp(SENSOR_ID_TEMP);      // °C
+Sensor            hum (SENSOR_ID_HUM);       // %RH
+Sensor            baro(SENSOR_ID_BARO);      // hPa
+Sensor            gas (SENSOR_ID_GAS);       // Ohms
+
+// Prefer SENSOR_ID_BSEC (legacy SID=171) which carries full comp_* fields
+// as noted in SensorBSEC docs/headers.
+SensorBSEC        bsec(SENSOR_ID_BSEC);      // IAQ, eCO2, bVOCeq, comp. T/H/G
+
+// (Optional)
+SensorActivity    activity    (SENSOR_ID_AR);
+Sensor            tilt        (SENSOR_ID_TILT_DETECTOR);
+Sensor            stepCounter (SENSOR_ID_STC);
+Sensor            stepDetector(SENSOR_ID_STD);
+
+// ======= Simple stats helpers ===============================================
+struct Stats1D {
+  double   sum = 0.0, sum2 = 0.0; uint32_t n = 0;
+  void   add(double v) { sum += v; sum2 += v*v; n++; }
+  double mean()  const { return n ? (sum / n) : NAN; }
+  double stddev()const { return (n > 1) ? sqrt((sum2 / n) - sq(sum / n)) : NAN; }
+  void   clear()       { sum = sum2 = 0.0; n = 0; }
+};
+struct Stats3D { Stats1D x,y,z; void add(double a,double b,double c){x.add(a);y.add(b);z.add(c);} void clear(){x.clear();y.clear();z.clear();} };
+
+// Quaternion “mean”: accumulate and renormalize (works for small spreads)
+struct QuatAcc {
+  double sw=0, sx=0, sy=0, sz=0; uint32_t n=0;
+  void add(double w,double x,double y,double z){ sw+=w; sx+=x; sy+=y; sz+=z; n++; }
+  bool meanUnit(double& w,double& x,double& y,double& z) const {
+    if(!n) return false; double mw=sw/n, mx=sx/n, my=sy/n, mz=sz/n;
+    double norm = sqrt(mw*mw+mx*mx+my*my+mz*mz); if(norm==0) return false;
+    w = mw/norm; x = mx/norm; y = my/norm; z = mz/norm; return true;
+  }
+  void clear(){ sw=sx=sy=sz=0; n=0; }
+};
+
+static Stats3D accS, gyroS, magS, laccS, gravS;
+static Stats1D tempS, humS, baroS, gasS, iaqS, eco2S, bvocS;
+static QuatAcc rvQ;
+static float lastPitch=NAN, lastRoll=NAN, lastHeading=NAN;
+
+static uint32_t lastPrint = 0;
+
+// Baro MoM storage
+static double baroMomBuf[BARO_MOM_GROUPS] = {NAN};
+static uint8_t baroMomCount = 0, baroMomIdx = 0;
+
+static inline double medianOf(double* a, uint8_t len){
+  double b[BARO_MOM_GROUPS];
+  for(uint8_t i=0;i<len;i++) b[i]=a[i];
+  // insertion sort (len <= 5)
+  for(uint8_t i=1;i<len;i++){ double v=b[i]; int j=i-1; while(j>=0 && b[j]>v){ b[j+1]=b[j]; j--; } b[j+1]=v; }
+  if(len==0) return NAN;
+  if(len%2) return b[len/2];
+  return 0.5*(b[len/2-1]+b[len/2]);
+}
+
+// ======= LED helpers (IAQ 1-step + hysteresis) ==============================
+static inline uint16_t clampU16(int v,int lo,int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+
+static void hsvToRgb(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t &b){
+  float c=v*s, h6=fmodf(h/60.f,6.f), x=c*(1.f-fabsf(fmodf(h6,2.f)-1.f)), m=v-c;
+  float rp=0,gp=0,bp=0;
+  if      (0.f<=h6 && h6<1.f){ rp=c; gp=x; bp=0; }
+  else if (1.f<=h6 && h6<2.f){ rp=x; gp=c; bp=0; }
+  else if (2.f<=h6 && h6<3.f){ rp=0; gp=c; bp=x; }
+  else if (3.f<=h6 && h6<4.f){ rp=0; gp=x; bp=c; }
+  else if (4.f<=h6 && h6<5.f){ rp=x; gp=0; bp=c; }
+  else                       { rp=c; gp=0; bp=x; }
+  r=(uint8_t)roundf((rp+m)*255.f); g=(uint8_t)roundf((gp+m)*255.f); b=(uint8_t)roundf((bp+m)*255.f);
+}
+static inline void setColorFromIdx(uint16_t idx){
+  // IAQ 0..500 -> hue 120..0 (green->red)
+  float hue = 120.f * (1.f - (idx/500.f));
+  uint8_t r,g,b; hsvToRgb(hue, LED_SAT, LED_VAL, r,g,b);
+  nicla::leds.setColor(r,g,b);
+}
+static void setColorForIAQ_1step_hyst(uint16_t iaq_raw){
+  static int16_t stableIdx = -1;
+  uint16_t idx = clampU16(iaq_raw, 0, 500);
+  if(stableIdx < 0){ stableIdx = (int16_t)idx; setColorFromIdx(idx); return; }
+  int diff = (int)idx - stableIdx;
+  if(diff >= (int)IAQ_HYSTERESIS_POINTS || diff <= -(int)IAQ_HYSTERESIS_POINTS){
+    stableIdx = (int16_t)idx; setColorFromIdx(idx);
+  }
+}
+static void updateStatusLED(){
+  static uint32_t lastLed=0; if(millis()-lastLed<PRINT_INTERVAL_MS) return; lastLed=millis();
+  switch(bsec.accuracy()){
+    case 0: nicla::leds.setColor(blue);   return;
+    case 1: nicla::leds.setColor(cyan);   return;
+    case 2: nicla::leds.setColor(yellow); return;
+    default: break;
+  }
+  float iaqMean = iaqS.mean(); if(isnan(iaqMean)){ nicla::leds.setColor(cyan); return; }
+  setColorForIAQ_1step_hyst((uint16_t)roundf(iaqMean));
+}
+
+// ======= Configure all sensors =============================================
+void configureAll(){
+  BHY2.begin();                        // standalone init  (Arduino example)  // [1](https://www.bosch-sensortec.com/products/environmental-sensors/gas-sensors/bme688/)
+
+  // ODRs
+  acc.configure (ODR_IMU_HZ, 0);
+  gyro.configure(ODR_IMU_HZ, 0);
+  lacc.configure(ODR_IMU_HZ, 0);
+  grav.configure(ODR_IMU_HZ, 0);
+  ori.configure (ODR_IMU_HZ, 0);
+  rv.configure  (ODR_IMU_HZ, 0);
+  mag.configure (ODR_MAG_HZ, 0);
+
+  temp.configure(ODR_ENV_HZ, 0);
+  hum .configure(ODR_ENV_HZ, 0);
+  baro.configure(ODR_ENV_HZ, 0);
+  gas .configure(ODR_ENV_HZ, 0);
+
+  // BSEC (IAQ)
+  bsec.begin();                        // IAQ stabilizes to accuracy=3 after warm-up  // [2](https://docs.arduino.cc/tutorials/nicla-sense-me/user-manual/)
+
+  // IMU range tuning:
+  // accel.setRange() uses a *code* (example passes 2 -> ±4 g).
+  // gyro.setRange() takes actual dps (e.g., 250/500/1000/2000).
+  acc.setRange (ACC_RANGE_CODE);
+  gyro.setRange(GYRO_RANGE_DPS);
+
+  // Optional activity/steps
+  activity.configure    (5, 0);
+  tilt.configure        (5, 0);
+  stepCounter.configure (1, 0);
+  stepDetector.configure(5, 0);
+
+  // Print back applied FSRs so you can confirm at runtime
+  SensorConfig cfg;
+  cfg = acc.getConfiguration();
+  Serial.print(F("Accel FSR applied: ±")); Serial.print(cfg.range); Serial.println(F(" g"));
+  cfg = gyro.getConfiguration();
+  Serial.print(F("Gyro  FSR applied: ±")); Serial.print(cfg.range); Serial.println(F(" dps"));
+}
+
+void setup(){
+  Serial.begin(115200);
+  while(!Serial && millis()<3000) {}
+  Serial.println(F("\nNicla Sense ME – Max-Precision Standalone + IAQ LED (1-step+hysteresis)"));
+  nicla::begin();
+  nicla::leds.begin();
+  nicla::leds.setColor(blue);    // boot indicator
+  configureAll();
+}
+
+void loop(){
+  BHY2.update();  // service the sensor hub continuously
+
+  // --------- Accumulate only on fresh events ----------
+  if(acc.dataAvailable())  { accS.add (acc.x(),  acc.y(),  acc.z());  acc.clearDataAvailFlag(); }
+  if(gyro.dataAvailable()) { gyroS.add(gyro.x(), gyro.y(), gyro.z()); gyro.clearDataAvailFlag(); }
+  if(mag.dataAvailable())  { magS.add (mag.x(),  mag.y(),  mag.z());  mag.clearDataAvailFlag(); }
+  if(lacc.dataAvailable()) { laccS.add(lacc.x(), lacc.y(), lacc.z()); lacc.clearDataAvailFlag(); }
+  if(grav.dataAvailable()) { gravS.add(grav.x(), grav.y(), grav.z()); grav.clearDataAvailFlag(); }
+
+  if(ori.dataAvailable()){
+    lastPitch   = ori.pitch();  lastRoll = ori.roll();  lastHeading = ori.heading();
+    ori.clearDataAvailFlag();
+  }
+  if(rv.dataAvailable()){
+    rvQ.add(rv.w(), rv.x(), rv.y(), rv.z());
+    rv.clearDataAvailFlag();
+  }
+
+  if(temp.dataAvailable()){ tempS.add(temp.value()); temp.clearDataAvailFlag(); }
+  if(hum .dataAvailable()){ humS .add(hum .value()); hum .clearDataAvailFlag(); }
+  if(baro.dataAvailable()){ baroS.add(baro.value()); baro.clearDataAvailFlag(); }
+  if(gas .dataAvailable()){ gasS .add(gas .value()); gas .clearDataAvailFlag(); }
+
+  // BSEC bundle (IAQ, eCO2, bVOCeq, comp_t/h/g) — add when new BSEC frame arrives
+  if(bsec.dataAvailable()){
+    iaqS .add(bsec.iaq());
+    eco2S.add(bsec.co2_eq());
+    bvocS.add(bsec.b_voc_eq());
+    // comp_t/h/g are printed live from bsec.* below
+    bsec.clearDataAvailFlag();
+  }
+
+  // --------- Once per window: print & MoM barometer ----------
+  uint32_t now = millis();
+  if(now - lastPrint >= PRINT_INTERVAL_MS){
+    lastPrint = now;
+
+    // Compute baro MoM5 (median of last BARO_MOM_GROUPS window means)
+    double thisBaroMean = baroS.mean();
+    if(!isnan(thisBaroMean)){
+      baroMomBuf[baroMomIdx] = thisBaroMean;
+      baroMomIdx = (baroMomIdx + 1) % BARO_MOM_GROUPS;
+      if(baroMomCount < BARO_MOM_GROUPS) baroMomCount++;
+    }
+    double baroMoM = medianOf(baroMomBuf, baroMomCount);
+
+    // Quaternion averaged (unit) for the window
+    double qw=0,qx=0,qy=0,qz=0; bool haveQ = rvQ.meanUnit(qw,qx,qy,qz);
+
+    Serial.println();
+    Serial.println(F("=================================================="));
+    Serial.println(F("Averaged high-precision snapshot"));
+
+    Serial.println(F("[Motion - means ± stddev]"));
+    Serial.print(F("  Acc (m/s^2):     "));
+    Serial.print(accS.x.mean(), 6); Serial.print(F(" ± ")); Serial.print(accS.x.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(accS.y.mean(), 6); Serial.print(F(" ± ")); Serial.print(accS.y.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(accS.z.mean(), 6); Serial.print(F(" ± ")); Serial.println(accS.z.stddev(), 6);
+
+    Serial.print(F("  Gyro (deg/s):    "));
+    Serial.print(gyroS.x.mean(), 6); Serial.print(F(" ± ")); Serial.print(gyroS.x.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(gyroS.y.mean(), 6); Serial.print(F(" ± ")); Serial.print(gyroS.y.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(gyroS.z.mean(), 6); Serial.print(F(" ± ")); Serial.println(gyroS.z.stddev(), 6);
+
+    Serial.print(F("  Mag (uT):        "));
+    Serial.print(magS.x.mean(), 6); Serial.print(F(" ± ")); Serial.print(magS.x.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(magS.y.mean(), 6); Serial.print(F(" ± ")); Serial.print(magS.y.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(magS.z.mean(), 6); Serial.print(F(" ± ")); Serial.println(magS.z.stddev(), 6);
+
+    Serial.print(F("  LinAcc (m/s^2):  "));
+    Serial.print(laccS.x.mean(), 6); Serial.print(F(" ± ")); Serial.print(laccS.x.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(laccS.y.mean(), 6); Serial.print(F(" ± ")); Serial.print(laccS.y.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(laccS.z.mean(), 6); Serial.print(F(" ± ")); Serial.println(laccS.z.stddev(), 6);
+
+    Serial.print(F("  Gravity (m/s^2): "));
+    Serial.print(gravS.x.mean(), 6); Serial.print(F(" ± ")); Serial.print(gravS.x.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(gravS.y.mean(), 6); Serial.print(F(" ± ")); Serial.print(gravS.y.stddev(), 6);
+    Serial.print(F(", ")); Serial.print(gravS.z.mean(), 6); Serial.print(F(" ± ")); Serial.println(gravS.z.stddev(), 6);
+
+    Serial.println(F("  Orientation (deg):"));
+    Serial.print (F("    pitch="));  Serial.print(lastPitch,   6);
+    Serial.print (F(", roll="));     Serial.print(lastRoll,    6);
+    Serial.print (F(", heading="));  Serial.println(lastHeading, 6);
+
+    Serial.print (F("  Rotation Vector (quat, avg): "));
+    if(haveQ){
+      Serial.print(F("w=")); Serial.print(qw, 6);
+      Serial.print(F(", x=")); Serial.print(qx, 6);
+      Serial.print(F(", y=")); Serial.print(qy, 6);
+      Serial.print(F(", z=")); Serial.println(qz, 6);
+    } else {
+      Serial.println(F("n/a"));
+    }
+
+    Serial.println(F("[Environmental - means ± stddev]"));
+    Serial.print(F("  Temperature (C): ")); Serial.print(tempS.mean(), 6); Serial.print(F(" ± ")); Serial.println(tempS.stddev(), 6);
+    Serial.print(F("  Humidity (%RH):  ")); Serial.print(humS.mean(), 6);  Serial.print(F(" ± ")); Serial.println(humS.stddev(), 6);
+
+    Serial.print(F("  Pressure (hPa):  "));
+    Serial.print(baroS.mean(), 6); Serial.print(F(" (1s mean), σ=")); Serial.println(baroS.stddev(), 6);
+
+    Serial.print(F("  Pressure MoM")); Serial.print(BARO_MOM_GROUPS); Serial.print(F(" (hPa): "));
+    if(!isnan(baroMoM)) Serial.println(baroMoM, 6); else Serial.println(F("n/a"));
+
+    Serial.print(F("  Gas (Ohms):      ")); Serial.print(gasS.mean(), 2);  Serial.print(F(" ± ")); Serial.println(gasS.stddev(), 2);
+
+    Serial.println(F("[Air Quality - BSEC]"));
+    Serial.print (F("  IAQ: "));         Serial.print(iaqS.mean(), 2);
+    Serial.print (F(" (acc "));           Serial.print(bsec.accuracy()); Serial.println(F(" of 3)"));
+    Serial.print (F("  eCO2 (ppm): "));  Serial.println(eco2S.mean(), 1);
+    Serial.print (F("  bVOCeq (ppm): "));Serial.println(bvocS.mean(), 3);
+    Serial.print (F("  Comp T/H/G: "));
+    Serial.print (bsec.comp_t(), 2); Serial.print(F(" C, "));
+    Serial.print (bsec.comp_h(), 2); Serial.print(F(" %RH, "));
+    Serial.print (bsec.comp_g());   Serial.println(F(" Ohms"));
+
+    Serial.print(F("Samples this window ~ IMU: "));
+    Serial.print(accS.x.n); Serial.print(F(", ENV: ")); Serial.println(tempS.n);
+
+    // LED update (warm-up gating + IAQ 1-step hysteresis)
+    updateStatusLED();
+
+    // Clear accumulators for next window
+    accS.clear(); gyroS.clear(); magS.clear(); laccS.clear(); gravS.clear();
+    tempS.clear(); humS.clear(); baroS.clear(); gasS.clear();
+    iaqS.clear();  eco2S.clear(); bvocS.clear(); rvQ.clear();
+  }
+}
