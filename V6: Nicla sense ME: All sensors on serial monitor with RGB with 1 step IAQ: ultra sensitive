@@ -1,0 +1,514 @@
+/*
+  Nicla Sense ME — Max-Precision Standalone
+  + True BSEC baseline persistence (compile-time hooks)
+  + BSEC warm-start hint fallback (current Arduino_BHY2)
+  + BMP390 MoM+EMA low-noise filter
+  + Magnetometer raw soft-cal pass (min–max)
+
+  Serial: 115200 baud
+*/
+
+// ============================ BSEC long payload ==============================
+// Enlarge fixed sensor frame so BSEC comp_t/comp_h/comp_g are present.
+// Must be defined BEFORE including Arduino_BHY2.h
+#ifndef SENSOR_DATA_FIXED_LENGTH
+#define SENSOR_DATA_FIXED_LENGTH 30
+#endif
+
+// ====================== Future BSEC baseline persistence =====================
+// When Arduino_BHY2 exposes BSEC state get/set APIs, enable the macro below and
+// map the function-like macros to the real API functions.
+// -----------------------------------------------------------------------------
+// #define BSEC_STATE_API_AVAILABLE
+// // Example (names are placeholders; replace with the actual ones):
+// extern size_t BHY2_getBSECState(uint8_t* buf, size_t maxlen);
+// extern bool   BHY2_setBSECState(const uint8_t* buf, size_t len);
+// #define BSEC_GET_STATE  BHY2_getBSECState
+// #define BSEC_SET_STATE  BHY2_setBSECState
+// -----------------------------------------------------------------------------
+
+#include "Arduino.h"
+#include "Arduino_BHY2.h"
+#include "Nicla_System.h"
+#include <math.h>
+
+// QSPI Flash (LittleFS) for persistence
+#include "SPIFBlockDevice.h"
+#include "LittleFileSystem.h"
+
+// ============================ Tunables ======================================
+#define ODR_IMU_HZ           200   // accel/gyro/fusions
+#define ODR_MAG_HZ            50   // magnetometer
+#define ODR_ENV_HZ            25   // temp/hum/press/gas
+#define PRINT_INTERVAL_MS   1000   // 1s window
+
+// IMU ranges: accel uses a *code* (2 => ±4 g), gyro uses actual dps
+#define ACC_RANGE_CODE         2   // code 2 → ±4 g (per Arduino example)
+#define GYRO_RANGE_DPS       250   // smallest safe dps for your motion
+
+// BMP390 software filtering (device OSR/IIR not exposed via Arduino_BHY2)
+#define BARO_MOM_GROUPS        5   // median of N window means (N<=5)
+#define BARO_EMA_TAU_S         5.0 // EMA time constant (seconds) over MoM
+
+// IAQ LED (hysteresis to avoid flicker)
+constexpr float   LED_SAT = 1.0f;
+constexpr float   LED_VAL = 0.3f;
+constexpr uint8_t IAQ_HYSTERESIS_POINTS = 3;
+
+// Magnetometer raw soft-calibration
+#define USE_MAG_SOFT_CAL
+#define RUN_MAG_CAL_SECONDS   20
+
+// BSEC persistence files (LittleFS on QSPI)
+#define BSEC_STATE_BIN_PATH  "/fs/bsec_state.bin"  // true baseline (future)
+#define BSEC_HINT_PATH       "/fs/bsec_hint.txt"   // warm-start UI hint (today)
+#define BSEC_SAVE_PERIOD_MS (5UL*60UL*1000UL)      // save every 5 minutes
+
+// ============================ Sensors =======================================
+SensorXYZ         acc (SENSOR_ID_ACC);
+SensorXYZ         gyro(SENSOR_ID_GYRO);
+SensorXYZ         mag (SENSOR_ID_MAG);        // corrected
+SensorXYZ         lacc(SENSOR_ID_LACC);
+SensorXYZ         grav(SENSOR_ID_GRA);
+SensorOrientation ori (SENSOR_ID_ORI);
+SensorQuaternion  rv  (SENSOR_ID_RV);
+
+#ifdef USE_MAG_SOFT_CAL
+SensorXYZ         magRaw(SENSOR_ID_MAG_RAW);   // raw for soft-cal
+#endif
+
+Sensor            temp(SENSOR_ID_TEMP);
+Sensor            hum (SENSOR_ID_HUM);
+Sensor            baro(SENSOR_ID_BARO);
+Sensor            gas (SENSOR_ID_GAS);
+
+// Prefer legacy BSEC (SID 171) to get full long frame (per library notes)
+SensorBSEC        bsec(SENSOR_ID_BSEC);
+
+// Activity / gestures (optional)
+SensorActivity    activity    (SENSOR_ID_AR);
+Sensor            tilt        (SENSOR_ID_TILT_DETECTOR);
+Sensor            stepCounter (SENSOR_ID_STC);
+Sensor            stepDetector(SENSOR_ID_STD);
+
+// ============================ Stats helpers =================================
+struct Stats1D {
+  double sum=0, sum2=0; uint32_t n=0;
+  void   add(double v){ sum+=v; sum2+=v*v; n++; }
+  double mean()  const { return n ? (sum/n) : NAN; }
+  double stddev()const { return (n>1) ? sqrt((sum2/n) - sq(sum/n)) : NAN; }
+  void   clear(){ sum=sum2=0; n=0; }
+};
+struct Stats3D { Stats1D x,y,z; void add(double a,double b,double c){x.add(a);y.add(b);z.add(c);} void clear(){x.clear();y.clear();z.clear();} };
+struct QuatAcc { double sw=0,sx=0,sy=0,sz=0; uint32_t n=0;
+  void add(double w,double x,double y,double z){ sw+=w; sx+=x; sy+=y; sz+=z; n++; }
+  bool meanUnit(double& w,double& x,double& y,double& z) const {
+    if(!n) return false; double mw=sw/n,mx=sx/n,my=sy/n,mz=sz/n;
+    double L=sqrt(mw*mw+mx*mx+my*my+mz*mz); if(L==0) return false;
+    w=mw/L; x=mx/L; y=my/L; z=mz/L; return true;
+  }
+  void clear(){ sw=sx=sy=sz=0; n=0; }
+};
+
+static Stats3D accS, gyroS, magS, laccS, gravS;
+#ifdef USE_MAG_SOFT_CAL
+static Stats3D magRawS;
+#endif
+static Stats1D tempS, humS, baroS, gasS, iaqS, eco2S, bvocS;
+static QuatAcc rvQ;
+static float lastPitch=NAN, lastRoll=NAN, lastHeading=NAN;
+static uint32_t lastPrint=0;
+
+// BMP390 MoM + EMA state
+static double baroMomBuf[BARO_MOM_GROUPS] = {NAN};
+static uint8_t baroMomCount=0, baroMomIdx=0;
+static double  baroEma = NAN, emaAlpha = 0.0;
+
+// ============================ LED helpers ===================================
+static inline uint16_t clampU16(int v,int lo,int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+static void hsvToRgb(float h,float s,float v,uint8_t& r,uint8_t& g,uint8_t& b){
+  float c=v*s, h6=fmodf(h/60.f,6.f), x=c*(1.f-fabsf(fmodf(h6,2.f)-1.f)), m=v-c;
+  float rp=0,gp=0,bp=0;
+  if      (0.f<=h6 && h6<1.f){ rp=c; gp=x; bp=0; }
+  else if (1.f<=h6 && h6<2.f){ rp=x; gp=c; bp=0; }
+  else if (2.f<=h6 && h6<3.f){ rp=0; gp=c; bp=x; }
+  else if (3.f<=h6 && h6<4.f){ rp=0; gp=x; bp=c; }
+  else if (4.f<=h6 && h6<5.f){ rp=x; gp=0; bp=c; }
+  else                       { rp=c; gp=0; bp=x; }
+  r=(uint8_t)roundf((rp+m)*255.f); g=(uint8_t)roundf((gp+m)*255.f); b=(uint8_t)roundf((bp+m)*255.f);
+}
+static inline void setColorFromIdx(uint16_t idx){
+  float hue = 120.f*(1.f - (idx/500.f)); uint8_t r,g,b; hsvToRgb(hue,LED_SAT,LED_VAL,r,g,b);
+  nicla::leds.setColor(r,g,b);
+}
+static void setColorForIAQ_1step_hyst(uint16_t iaq_raw){
+  static int16_t stable=-1; uint16_t idx=clampU16(iaq_raw,0,500);
+  if(stable<0){ stable=(int16_t)idx; setColorFromIdx(idx); return; }
+  int d=(int)idx-stable;
+  if(d>=IAQ_HYSTERESIS_POINTS || d<=-IAQ_HYSTERESIS_POINTS){ stable=(int16_t)idx; setColorFromIdx(idx); }
+}
+static void updateStatusLED(){
+  static uint32_t last=0; if(millis()-last<PRINT_INTERVAL_MS) return; last=millis();
+  switch(bsec.accuracy()){
+    case 0: nicla::leds.setColor(blue);   return;
+    case 1: nicla::leds.setColor(cyan);   return;
+    case 2: nicla::leds.setColor(yellow); return;
+    default: break;
+  }
+  float iaqMean=iaqS.mean(); if(isnan(iaqMean)){ nicla::leds.setColor(cyan); return; }
+  setColorForIAQ_1step_hyst((uint16_t)roundf(iaqMean));
+}
+
+// ============================ File system (QSPI) =============================
+SPIFBlockDevice spif(SPI_PSELMOSI0, SPI_PSELMISO0, SPI_PSELSCK0, CS_FLASH);
+mbed::LittleFileSystem fs("fs");
+static bool fsReady=false;
+
+static bool fsInit(){
+  if(fsReady) return true;
+  int err = fs.mount(&spif);
+  if(err){ err = fs.reformat(&spif); }
+  fsReady = (err==0);
+  return fsReady;
+}
+
+// ---------- “True” BSEC baseline (future, guarded) ----------
+#ifdef BSEC_STATE_API_AVAILABLE
+static bool saveBsecStateBinary(){
+  if(!fsInit()) return false;
+  uint8_t buf[1024];
+  size_t n = BSEC_GET_STATE(buf, sizeof(buf));      // map to real API
+  if(n==0 || n>sizeof(buf)) return false;
+  FILE* f = fopen(BSEC_STATE_BIN_PATH, "wb");
+  if(!f) return false;
+  size_t w = fwrite(buf,1,n,f); fclose(f);
+  return w==n;
+}
+static bool loadBsecStateBinary(){
+  if(!fsInit()) return false;
+  FILE* f = fopen(BSEC_STATE_BIN_PATH, "rb");
+  if(!f) return false;
+  uint8_t buf[1024]; size_t n = fread(buf,1,sizeof(buf),f); fclose(f);
+  if(n==0) return false;
+  return BSEC_SET_STATE(buf,n);                    // map to real API
+}
+#else
+static bool saveBsecStateBinary(){ return false; }
+static bool loadBsecStateBinary(){ return false; }
+#endif
+
+// ---------- Warm-start UI hint (works today) ----------
+static uint32_t lastBsecHintSave=0;
+static void saveBsecHintIfDue(){
+  if(!fsInit()) return;
+  if(millis() - lastBsecHintSave < BSEC_SAVE_PERIOD_MS) return;
+  lastBsecHintSave = millis();
+  FILE* f = fopen(BSEC_HINT_PATH, "w");
+  if(!f) return;
+  fprintf(f, "t=%lu,iaq=%.1f,ct=%.2f,ch=%.2f,cg=%lu\n",
+          (unsigned long)millis(),
+          iaqS.mean(), bsec.comp_t(), bsec.comp_h(), (unsigned long)bsec.comp_g());
+  fclose(f);
+}
+static bool loadBsecHint(float& iaq, float& ct, float& ch, uint32_t& cg){
+  if(!fsInit()) return false;
+  FILE* f = fopen(BSEC_HINT_PATH, "r");
+  if(!f) return false;
+  unsigned long t=0; float li=0, lt=0, lh=0; unsigned long lg=0;
+  int n = fscanf(f, "t=%lu,iaq=%f,ct=%f,ch=%f,cg=%lu", &t,&li,&lt,&lh,&lg);
+  fclose(f);
+  if(n==5){ iaq=li; ct=lt; ch=lh; cg=(uint32_t)lg; return true; }
+  return false;
+}
+
+// ============================ Mag raw soft-cal ===============================
+#ifdef USE_MAG_SOFT_CAL
+static bool  magCalReady=false;
+static float magOffX=0, magOffY=0, magOffZ=0;
+
+static void runMagCalibration(uint32_t seconds){
+  Serial.println(F("[Mag Cal] Rotate board in all orientations..."));
+  nicla::leds.setColor(magenta);
+
+  float minX= 1e9, minY= 1e9, minZ= 1e9;
+  float maxX=-1e9, maxY=-1e9, maxZ=-1e9;
+
+  uint32_t endAt = millis() + seconds*1000UL;
+  while((int32_t)(endAt - millis()) > 0){
+    BHY2.update();
+    if(magRaw.dataAvailable()){
+      float x=magRaw.x(), y=magRaw.y(), z=magRaw.z();
+      if(x<minX) minX=x; if(y<minY) minY=y; if(z<minZ) minZ=z;
+      if(x>maxX) maxX=x; if(y>maxY) maxY=y; if(z>maxZ) maxZ=z;
+      magRaw.clearDataAvailFlag();
+    }
+  }
+  magOffX = 0.5f*(maxX+minX);
+  magOffY = 0.5f*(maxY+minY);
+  magOffZ = 0.5f*(maxZ+minZ);
+  magCalReady = isfinite(magOffX)&&isfinite(magOffY)&&isfinite(magOffZ);
+
+  Serial.print(F("[Mag Cal] Offsets X/Y/Z (uT): "));
+  Serial.print(magOffX,3); Serial.print(F(", "));
+  Serial.print(magOffY,3); Serial.print(F(", "));
+  Serial.println(magOffZ,3);
+
+  nicla::leds.setColor(blue);
+}
+#endif
+
+// ============================ Configure =====================================
+void configureAll(){
+  BHY2.begin();  // standalone init
+
+  // Streams & rates
+  acc.configure (ODR_IMU_HZ, 0);
+  gyro.configure(ODR_IMU_HZ, 0);
+  lacc.configure(ODR_IMU_HZ, 0);
+  grav.configure(ODR_IMU_HZ, 0);
+  ori.configure (ODR_IMU_HZ, 0);
+  rv.configure  (ODR_IMU_HZ, 0);
+  mag.configure (ODR_MAG_HZ, 0);
+#ifdef USE_MAG_SOFT_CAL
+  magRaw.configure(ODR_MAG_HZ, 0);
+#endif
+
+  temp.configure(ODR_ENV_HZ, 0);
+  hum .configure(ODR_ENV_HZ, 0);
+  baro.configure(ODR_ENV_HZ, 0);
+  gas .configure(ODR_ENV_HZ, 0);
+
+  // BSEC algorithm (IAQ etc.)
+  bsec.begin();
+
+  // IMU ranges (accel code, gyro dps)
+  acc.setRange (ACC_RANGE_CODE);    // code 2 => ±4 g (per example)
+  gyro.setRange(GYRO_RANGE_DPS);    // e.g., 250/500/1000/2000
+
+  // Optional UX streams
+  activity.configure    (5, 0);
+  tilt.configure        (5, 0);
+  stepCounter.configure (1, 0);
+  stepDetector.configure(5, 0);
+
+  // Print applied FSRs (verify library mapping)
+  SensorConfig cfg;
+  cfg = acc.getConfiguration();
+  Serial.print(F("Accel FSR applied: ±")); Serial.print(cfg.range); Serial.println(F(" g"));
+  cfg = gyro.getConfiguration();
+  Serial.print(F("Gyro  FSR applied: ±")); Serial.print(cfg.range); Serial.println(F(" dps"));
+
+  // EMA alpha for baro (1 - exp(-dt/tau))
+  emaAlpha = 1.0 - exp(- (double)PRINT_INTERVAL_MS / 1000.0 / BARO_EMA_TAU_S);
+}
+
+// ============================ Setup / Loop ==================================
+void setup(){
+  Serial.begin(115200);
+  while(!Serial && millis()<3000) {}
+  Serial.println(F("\nNicla Sense ME — Max-Precision + BSEC baseline hooks + MoM+EMA + Mag soft-cal"));
+
+  nicla::begin();
+  nicla::leds.begin();
+  nicla::leds.setColor(blue);
+
+  configureAll();
+
+  // Attempt TRUE BSEC baseline restore (when API is available)
+  if(loadBsecStateBinary()){
+    Serial.println(F("[BSEC baseline] Restored true baseline from /fs/bsec_state.bin"));
+  }else{
+    // Fallback: warm-start UI hint (usable today)
+    float iaq=0, ct=0, ch=0; uint32_t cg=0;
+    if(loadBsecHint(iaq, ct, ch, cg)){
+      iaqS.add(iaq);
+      Serial.print(F("[BSEC warm-start] IAQ=")); Serial.print(iaq,1);
+      Serial.print(F(", compT/H/G=")); Serial.print(ct,2); Serial.print(F("C, "));
+      Serial.print(ch,2); Serial.print(F("%, ")); Serial.print(cg); Serial.println(F(" Ohms"));
+    }else{
+      Serial.println(F("[BSEC] No baseline or hint yet; converging from cold start."));
+    }
+  }
+
+#ifdef USE_MAG_SOFT_CAL
+  runMagCalibration(RUN_MAG_CAL_SECONDS);
+#endif
+}
+
+void loop(){
+  BHY2.update();
+
+  // Motion / mag (corrected)
+  if(acc.dataAvailable()){  accS.add(acc.x(),acc.y(),acc.z()); acc.clearDataAvailFlag(); }
+  if(gyro.dataAvailable()){ gyroS.add(gyro.x(),gyro.y(),gyro.z()); gyro.clearDataAvailFlag(); }
+  if(mag.dataAvailable()){   magS.add(mag.x(),mag.y(),mag.z());   mag.clearDataAvailFlag(); }
+
+#ifdef USE_MAG_SOFT_CAL
+  if(magRaw.dataAvailable()){
+    float x=magRaw.x(), y=magRaw.y(), z=magRaw.z();
+    if(magCalReady){ x-=magOffX; y-=magOffY; z-=magOffZ; }
+    magRawS.add(x,y,z);
+    magRaw.clearDataAvailFlag();
+  }
+#endif
+
+  if(lacc.dataAvailable()){ laccS.add(lacc.x(),lacc.y(),lacc.z()); lacc.clearDataAvailFlag(); }
+  if(grav.dataAvailable()){ gravS.add(grav.x(),grav.y(),grav.z()); grav.clearDataAvailFlag(); }
+
+  if(ori.dataAvailable()){
+    lastPitch=ori.pitch(); lastRoll=ori.roll(); lastHeading=ori.heading();
+    ori.clearDataAvailFlag();
+  }
+  if(rv.dataAvailable()){ rvQ.add(rv.w(),rv.x(),rv.y(),rv.z()); rv.clearDataAvailFlag(); }
+
+  // Environmental
+  if(temp.dataAvailable()){ tempS.add(temp.value()); temp.clearDataAvailFlag(); }
+  if(hum .dataAvailable()){ humS .add(hum .value()); hum .clearDataAvailFlag(); }
+  if(baro.dataAvailable()){ baroS.add(baro.value()); baro.clearDataAvailFlag(); }
+  if(gas .dataAvailable()){ gasS .add(gas .value()); gas .clearDataAvailFlag(); }
+
+  // BSEC frame
+  if(bsec.dataAvailable()){
+    iaqS .add(bsec.iaq());
+    eco2S.add(bsec.co2_eq());
+    bvocS.add(bsec.b_voc_eq());
+    bsec.clearDataAvailFlag();
+  }
+
+  // Window finalize
+  const uint32_t now = millis();
+  if(now - lastPrint >= PRINT_INTERVAL_MS){
+    lastPrint = now;
+
+    // Baro MoM
+    double m = baroS.mean();
+    if(!isnan(m)){
+      baroMomBuf[baroMomIdx] = m;
+      baroMomIdx = (baroMomIdx+1) % BARO_MOM_GROUPS;
+      if(baroMomCount < BARO_MOM_GROUPS) baroMomCount++;
+    }
+    double baroMoM = (baroMomCount>0) ? ([&]{
+      double tmp[BARO_MOM_GROUPS];
+      for(uint8_t i=0;i<baroMomCount;i++) tmp[i]=baroMomBuf[i];
+      // median helper inline
+      // (reuse the same insertion sort logic)
+      for(uint8_t i=1;i<baroMomCount;i++){ double v=tmp[i]; int j=i-1; while(j>=0 && tmp[j]>v){ tmp[j+1]=tmp[j]; j--; } tmp[j+1]=v; }
+      return (baroMomCount&1)? tmp[baroMomCount/2] : 0.5*(tmp[baroMomCount/2-1]+tmp[baroMomCount/2]);
+    }()): NAN;
+
+    // Baro EMA over MoM
+    if(!isnan(baroMoM)){
+      if(isnan(baroEma)) baroEma = baroMoM;
+      else               baroEma = baroEma + emaAlpha*(baroMoM - baroEma);
+    }
+
+    // Quaternion mean
+    double qw=0,qx=0,qy=0,qz=0; bool haveQ = rvQ.meanUnit(qw,qx,qy,qz);
+
+    // -------- Print snapshot --------
+    Serial.println();
+    Serial.println(F("=================================================="));
+    Serial.println(F("Averaged high-precision snapshot"));
+
+    Serial.println(F("[Motion - means ± stddev]"));
+    Serial.print(F("  Acc (m/s^2):     "));
+    Serial.print(accS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(accS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(accS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(accS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(accS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(accS.z.stddev(),6);
+
+    Serial.print(F("  Gyro (deg/s):    "));
+    Serial.print(gyroS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(gyroS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(gyroS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(gyroS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(gyroS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(gyroS.z.stddev(),6);
+
+    Serial.print(F("  Mag (uT, corrected): "));
+    Serial.print(magS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(magS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(magS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(magS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(magS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(magS.z.stddev(),6);
+
+#ifdef USE_MAG_SOFT_CAL
+    Serial.print(F("  Mag (uT, RAW soft-cal): "));
+    Serial.print(magRawS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(magRawS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(magRawS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(magRawS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(magRawS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(magRawS.z.stddev(),6);
+#endif
+
+    Serial.print(F("  LinAcc (m/s^2):  "));
+    Serial.print(laccS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(laccS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(laccS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(laccS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(laccS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(laccS.z.stddev(),6);
+
+    Serial.print(F("  Gravity (m/s^2): "));
+    Serial.print(gravS.x.mean(),6); Serial.print(F(" ± ")); Serial.print(gravS.x.stddev(),6);
+    Serial.print(F(", ")); Serial.print(gravS.y.mean(),6); Serial.print(F(" ± ")); Serial.print(gravS.y.stddev(),6);
+    Serial.print(F(", ")); Serial.print(gravS.z.mean(),6); Serial.print(F(" ± ")); Serial.println(gravS.z.stddev(),6);
+
+    Serial.println(F("  Orientation (deg):"));
+    Serial.print (F("    pitch="));  Serial.print(lastPitch,6);
+    Serial.print (F(", roll="));     Serial.print(lastRoll,6);
+    Serial.print (F(", heading="));  Serial.println(lastHeading,6);
+
+    Serial.print(F("  Rotation Vector (quat, avg): "));
+    if(haveQ){
+      Serial.print(F("w=")); Serial.print(qw,6);
+      Serial.print(F(", x=")); Serial.print(qx,6);
+      Serial.print(F(", y=")); Serial.print(qy,6);
+      Serial.print(F(", z=")); Serial.println(qz,6);
+    } else {
+      Serial.println(F("n/a"));
+    }
+
+    Serial.println(F("[Environmental - means ± stddev]"));
+    Serial.print(F("  Temperature (C): ")); Serial.print(tempS.mean(),6); Serial.print(F(" ± ")); Serial.println(tempS.stddev(),6);
+    Serial.print(F("  Humidity (%RH):  ")); Serial.print(humS.mean(),6);  Serial.print(F(" ± ")); Serial.println(humS.stddev(),6);
+
+    Serial.print(F("  Pressure (hPa):  "));
+    Serial.print(baroS.mean(),6); Serial.print(F(" (1s mean), σ=")); Serial.println(baroS.stddev(),6);
+
+    Serial.print(F("  Pressure MoM")); Serial.print(BARO_MOM_GROUPS);
+    Serial.print(F(" (hPa): ")); 
+    double baroMoM = (baroMomCount>0) ? 0.0 : NAN; // printed above via inline; recompute quickly for print:
+    if(baroMomCount>0){
+      double tmp[BARO_MOM_GROUPS];
+      for(uint8_t i=0;i<baroMomCount;i++) tmp[i]=baroMomBuf[i];
+      for(uint8_t i=1;i<baroMomCount;i++){ double v=tmp[i]; int j=i-1; while(j>=0 && tmp[j]>v){ tmp[j+1]=tmp[j]; j--; } tmp[j+1]=v; }
+      baroMoM = (baroMomCount&1)? tmp[baroMomCount/2] : 0.5*(tmp[baroMomCount/2-1]+tmp[baroMomCount/2]);
+      Serial.println(baroMoM,6);
+    } else Serial.println(F("n/a"));
+
+    Serial.print(F("  Pressure EMA (hPa): "));
+    if(!isnan(baroEma)) Serial.println(baroEma,6); else Serial.println(F("n/a"));
+
+    Serial.print(F("  Gas (Ohms):      ")); Serial.print(gasS.mean(),2); Serial.print(F(" ± ")); Serial.println(gasS.stddev(),2);
+
+    Serial.println(F("[Air Quality - BSEC]"));
+    Serial.print (F("  IAQ: "));        Serial.print(iaqS.mean(),2);
+    Serial.print (F(" (acc "));          Serial.print(bsec.accuracy()); Serial.println(F(" of 3)"));
+    Serial.print (F("  eCO2 (ppm): "));  Serial.println(eco2S.mean(),1);
+    Serial.print (F("  bVOCeq (ppm): "));Serial.println(bvocS.mean(),3);
+    Serial.print (F("  Comp T/H/G: "));
+    Serial.print (bsec.comp_t(),2); Serial.print(F(" C, "));
+    Serial.print (bsec.comp_h(),2); Serial.print(F(" %RH, "));
+    Serial.print (bsec.comp_g());   Serial.println(F(" Ohms"));
+
+    Serial.print(F("Samples this window ~ IMU: "));
+    Serial.print(accS.x.n); Serial.print(F(", ENV: ")); Serial.println(tempS.n);
+
+    // LED & persistence
+    updateStatusLED();
+#ifdef BSEC_STATE_API_AVAILABLE
+    // Save true BSEC baseline if available
+    saveBsecStateBinary();
+#else
+    // Otherwise save the warm-start hint for UI continuity
+    saveBsecHintIfDue();
+#endif
+    // Clear accumulators
+    accS.clear(); gyroS.clear(); magS.clear(); laccS.clear(); gravS.clear();
+#ifdef USE_MAG_SOFT_CAL
+    magRawS.clear();
+#endif
+    tempS.clear(); humS.clear(); baroS.clear(); gasS.clear();
+    iaqS.clear();  eco2S.clear(); bvocS.clear(); rvQ.clear();
+  }
+}
