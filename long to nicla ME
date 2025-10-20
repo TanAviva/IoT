@@ -1,0 +1,169 @@
+/**
+ * @file      QWIIC_Sensor_NiclaHost.ino
+ * @author    Adapted for Nicla Sense ME (based on original QWIIC_Sensor.ino)
+ * @license   MIT
+ * @date      2025-10-20
+ * @brief     Read environmental data from Nicla Sense ME via ESLOV (I2C) using BHY2Host,
+ *            and read touch points via AXS15231B on T-Display-Long.
+ *
+ * Hardware:
+ *  - Host: LilyGO T-Display-S3 Long (ESP32-S3)
+ *  - Client: Arduino Nicla Sense ME connected via ESLOV ↔ Host I2C (3.3V, SDA, SCL, GND)
+ *
+ * Notes:
+ *  - Flash "App" to the Nicla (Examples > Arduino_BHY2 > App) so it acts as a client
+ *    listening over ESLOV/BLE.  (see setup steps below)
+ *  - On the host we use Arduino_BHY2Host to create Sensor objects for Nicla’s virtual sensors.
+ *  - Touch driver and I2C pins are left as in your original sketch.
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include "AXS15231B.h"
+
+// ---- Nicla Sense ME Host library ----
+#include <Arduino_BHY2Host.h>   // Provides BHY2Host, Sensor/SensorXYZ classes & SensorID constants
+
+// ------------------------ Nicla sensor handles ------------------------
+// Environmental sensors available on Nicla Sense ME:
+//  - Temperature:     SENSOR_ID_TEMP
+//  - Humidity:        SENSOR_ID_HUM
+//  - Pressure (baro): SENSOR_ID_BARO
+// (IDs are defined by Arduino_BHY2*/SensorID.h and map to BME688/BMP390 virtual sensors)
+Sensor     niclaTemp (SENSOR_ID_TEMP);
+Sensor     niclaHum  (SENSOR_ID_HUM);
+Sensor     niclaBaro (SENSOR_ID_BARO);
+
+// (Optional) IMU example: uncomment if you also want acceleration
+// SensorXYZ  niclaAcc  (SENSOR_ID_ACC);
+
+// ------------------------ Timing ------------------------
+uint32_t nextPrintMs = 0;
+
+// ------------------------ Touch helpers (unchanged) ------------------------
+void readTouch();
+
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial) { /* wait for USB CDC */ }
+
+    // --- Touch reset sequence (as per your original) ---
+    pinMode(TOUCH_RES, OUTPUT);
+    digitalWrite(TOUCH_RES, HIGH); delay(2);
+    digitalWrite(TOUCH_RES, LOW);  delay(10);
+    digitalWrite(TOUCH_RES, HIGH); delay(2);
+
+    // --- I2C bus used by touch + Qwiic/ESLOV on the T-Display-Long ---
+    // Touch uses Wire on pins TOUCH_IICSDA / TOUCH_IICSCL (board definitions).
+    // We keep the same bus for Nicla ESLOV (shared I2C).
+    Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
+
+    // Touch requires display init first (per vendor note)
+    axs15231_init();
+
+    // ------------------------ Nicla host init ------------------------
+    // IMPORTANT:
+    // 1) Flash the Nicla with Examples > Arduino_BHY2 > App (see notes below)
+    // 2) Wire Nicla ESLOV to this I2C bus (3V3, GND, SDA, SCL).
+    //
+    // Start BHY2Host in ESLOV (I2C) mode.
+    if (!BHY2Host.begin(false, NICLA_VIA_ESLOV)) {
+        Serial.println("[ERR] BHY2Host.begin() failed. Check wiring and Nicla firmware.");
+    } else {
+        Serial.println("[OK ] BHY2Host connected to Nicla over ESLOV/I2C.");
+    }
+
+    // Begin individual sensors
+    niclaTemp.begin();
+    niclaHum.begin();
+    niclaBaro.begin();
+    // niclaAcc.begin();   // if using IMU
+
+    Serial.println();
+}
+
+static float seaLevel_hPa = 1013.25f;  // Update with local sea-level pressure for better altitude
+
+void loop()
+{
+    // Must be called regularly so the host fetches/decodes data from Nicla
+    BHY2Host.update();
+
+    // Print every ~2 seconds
+    const uint32_t now = millis();
+    if (now >= nextPrintMs) {
+        nextPrintMs = now + 2000;
+
+        // Read environmental values
+        const float tC   = niclaTemp.value();       // °C
+        const float rh   = niclaHum.value();        // % RH
+        const float hPa  = niclaBaro.value();       // hPa
+
+        // Compute barometric altitude using the same standard sea-level reference
+        float altitude_m = NAN;
+        if (hPa > 0.0f) {
+            // International barometric formula (same idea as Adafruit_BME280::readAltitude)
+            altitude_m = 44330.0f * (1.0f - powf(hPa / seaLevel_hPa, 0.1903f));
+        }
+
+        Serial.print("Temperature = ");
+        Serial.print(tC, 2);
+        Serial.println(" °C");
+
+        Serial.print("Humidity = ");
+        Serial.print(rh, 2);
+        Serial.println(" %");
+
+        Serial.print("Pressure = ");
+        Serial.print(hPa, 2);
+        Serial.println(" hPa");
+
+        Serial.print("Approx. Altitude = ");
+        if (isnan(altitude_m)) Serial.println("n/a");
+        else { Serial.print(altitude_m, 2); Serial.println(" m"); }
+
+        Serial.println();
+
+        // (Optional) IMU sample
+        // Serial.println(String("Acceleration: ") + niclaAcc.toString());
+    }
+
+    // Read touch at high rate (unchanged behavior)
+    readTouch();
+
+    delay(10);
+}
+
+// ------------------------ Touch reader (unchanged from your code) ------------------------
+void readTouch()
+{
+    #define AXS_GET_GESTURE_TYPE(buf)  buf[0]
+    #define AXS_GET_POINT_X(buf,point_index) (((uint16_t)(buf[6*point_index+2] & 0x0F) << 8) + (uint16_t)buf[6*point_index+3])
+    #define AXS_GET_POINT_Y(buf,point_index) (((uint16_t)(buf[6*point_index+4] & 0x0F) << 8) + (uint16_t)buf[6*point_index+5])
+
+    const uint8_t ALS_ADDRESS = 0x3B;
+    const uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x0, 0x0, 0x0, 0x8};
+    uint8_t buff[20] = {0};
+
+    Wire.beginTransmission(ALS_ADDRESS);
+    Wire.write(read_touchpad_cmd, 8);
+    Wire.endTransmission();
+
+    Wire.requestFrom(ALS_ADDRESS, 8);
+    while (!Wire.available());
+    Wire.readBytes(buff, 8);
+
+    uint16_t type = AXS_GET_GESTURE_TYPE(buff);
+    uint16_t pointX = AXS_GET_POINT_X(buff, 0);
+    uint16_t pointY = AXS_GET_POINT_Y(buff, 0);
+
+    if (!type && (pointX || pointY)) {
+        pointX = (640 - pointX);
+        if (pointX > 640) pointX = 640;
+        if (pointY > 180) pointY = 180;
+
+        Serial.printf("x = %d, y = %d\n", pointX, pointY);
+    }
+}
