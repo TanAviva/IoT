@@ -1,0 +1,68 @@
+#include <Wire.h>
+#include <SparkFunTMP117.h>  // SparkFun TMP117 library
+
+// Default I2C address for TMP117 (ADR pin floating): 0x48
+#define TMP117_ADDR 0x48
+
+SFE_TMP117 tmp117;
+
+constexpr uint32_t WARMUP_MS   = 60UL * 1000UL; // 60 s warm-up
+constexpr uint16_t AVG_COUNT   = 60;            // average 60 readings
+constexpr uint32_t PRINT_EVERY = 1000UL;        // 1 s between reads
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  // Start I2C
+  Wire.begin();
+  Wire.setClock(400000); // Fast-mode I2C (optional; TMP117 supports it)
+
+  Serial.println("TMP117 accuracy-optimized setup (1 s conversion, 60 s warm-up + average)");
+
+  // Initialize TMP117 at a known address
+  if (!tmp117.begin(TMP117_ADDR, Wire)) {
+    Serial.println("ERROR: TMP117 not found. Check wiring/address.");
+    while (1) delay(1000);
+  }
+
+  // Set conversion cycle to 1 Hz (1-second conversion time)
+  // Library call names may be: setConversionCycle(TMP117_CONV_1HZ) or setConversionMode, depending on library version.
+  // The following variants are commonly supported:
+  bool ok = true;
+  ok &= tmp117.setConversionMode(TMP117_CONTINUOUS); // Continuous conversions
+  ok &= tmp117.setConversionAverageMode(TMP117_AVG_8); // Optional: internal averaging (if available)
+  ok &= tmp117.setConversionCycle(TMP117_CONV_1HZ);    // 1 s per conversion
+
+  if (!ok) {
+    Serial.println("WARNING: One or more configuration calls failed; proceeding with defaults.");
+  }
+
+  // Warm-up period to reach thermal equilibrium
+  Serial.println("Warming up for 60 seconds...");
+  delay(WARMUP_MS);
+
+  // Discard the very first post-warm reading (just to be safe)
+  (void) tmp117.getTemperature();
+}
+
+void loop() {
+  // Average 60 readings taken once per second
+  double sumC = 0.0;
+  for (uint16_t i = 0; i < AVG_COUNT; i++) {
+    // Wait for conversion complete (library polls or we can delay)
+    // Many TMP117 libs support dataReady(). If present, prefer that:
+    // while (!tmp117.dataReady()) { delay(1); }
+
+    double tC = tmp117.getTemperature(); // returns Celsius
+    sumC += tC;
+    delay(PRINT_EVERY);
+  }
+  double avgC = sumC / AVG_COUNT;
+
+  // Print with full sensor resolution (0.0078125°C steps) but remember accuracy is ±0.1°C typ.
+  Serial.print("Averaged temperature (60s @1s conv): ");
+  Serial.print(avgC, 4); // 4 decimals shows the 1/128°C resolution neatly
+  Serial.println(" °C");
+}
+``
