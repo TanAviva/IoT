@@ -1,0 +1,399 @@
+/*
+ * T-Display S3 Long (AXS15231B, 180x640) + TMP117
+ * Adds derived metrics:
+ *   - Δ vs. Average (current - mean)
+ *   - Rate of Change (°C/s)
+ *   - Min / Max in 1-minute window
+ *   - Standard Deviation (σ) in 1-minute window
+ *   - Estimated Sensor Accuracy (shown in spec card)
+ *
+ * I2C wiring (verify yours; many S3 Long builds use SDA=15, SCL=10):
+ *   3V3  → TMP117 VCC
+ *   GND  → TMP117 GND
+ *   GPIO15 (SDA) → TMP117 SDA
+ *   GPIO10 (SCL) → TMP117 SCL
+ *
+ * Display note:
+ *   Render to a 640x180 TFT_eSPI sprite, then push with lcd_PushColors_rotated_90()
+ *   using LilyGO’s AXS15231B driver (from their repo /lib).
+ *
+ * TMP117 references:
+ *   - TI datasheet: device ID = 0x0117 @ reg 0x0F; configuration reset = 0x0220
+ *     (Continuous mode, ~1 Hz, 8× averaging; LSB = 0.0078125 °C) [see citations]
+ */
+
+#include "AXS15231B.h"   // LilyGO driver (Xinyuan-LilyGO/T-Display-S3-Long /lib)
+#include <Arduino.h>
+#include <TFT_eSPI.h>    // Sprite engine
+#include <Wire.h>
+#include <math.h>
+
+// ============================ USER CONFIG ============================
+#define I2C_SDA_PIN 15
+#define I2C_SCL_PIN 10
+
+// TMP117 registers and address
+#define TMP117_ADDR      0x48
+#define REG_TEMP_RESULT  0x00
+#define REG_CONFIG       0x01
+#define REG_DEVICE_ID    0x0F
+
+// Operating profile (recommended for stability)
+static const uint32_t CONV_INTERVAL_MS = 1000;   // 1 s conversion cadence (matches ~1 Hz profile)
+static const uint32_t WARMUP_MS        = 30000;  // 30 s warm-up (set 60000 if you prefer)
+static const uint16_t WINDOW_SAMPLES   = 60;     // 60 samples → ~1-minute window
+
+// Theme
+#define COL_BG        0x0000   // Black
+#define COL_PANEL     0x0842   // Very dark grey-blue
+#define COL_FRAME     0x3186   // Medium grey outline
+#define COL_TEXT      0xFFFF   // White
+#define COL_MUTED     0xAD55   // Light grey
+#define COL_ACCENT    0xFDA0   // Orange
+#define COL_ACCENT2   0x07FF   // Cyan
+#define COL_GOOD      0x07E0   // Green
+#define COL_WARN      0xFFE0   // Yellow
+#define COL_BAD       0xF800   // Red
+#define COL_BAR_BG    0x0841   // Bar background
+
+// Layout
+static const int  TITLE_Y       = 8;
+static const int  TEMP_Y        = 86;
+static const int  AVG_Y         = 146;
+
+static const int  CARD_X        = 10;
+static const int  CARD_Y        = 32;
+static const int  CARD_W        = 210;
+static const int  CARD_H        = 132;
+
+static const int  PROG_W        = 380;
+static const int  PROG_H        = 12;
+static const int  PROG_X        = 240;
+static const int  PROG_Y_TOP    = 46;   // warm-up progress bar Y
+static const int  PROG_Y_BOT    = 66;   // averaging progress bar Y
+
+// ====================================================================
+
+// Display objects
+TFT_eSPI tft(180, 640);
+TFT_eSprite sprite(&tft);
+
+// ---------- TMP117 low-level helpers ----------
+static bool writeReg16(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(TMP117_ADDR);
+  Wire.write(reg);
+  Wire.write(value >> 8);        // MSB first (per datasheet)
+  Wire.write(value & 0xFF);      // LSB
+  return (Wire.endTransmission() == 0);
+}
+
+static bool readReg16(uint8_t reg, uint16_t &value) {
+  Wire.beginTransmission(TMP117_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;  // repeated START (not required but OK)
+  if (Wire.requestFrom((int)TMP117_ADDR, 2) != 2) return false;
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  value = ((uint16_t)msb << 8) | lsb;
+  return true;
+}
+
+static inline float rawToC(uint16_t raw) {
+  int16_t s = (int16_t)raw;      // two's complement
+  return (float)s * 0.0078125f;  // 1/128 °C per LSB
+}
+
+// ---------- TMP117 configuration (recommendation implemented) ----------
+/*
+ * Program the TMP117 to its documented reset profile:
+ *   - MOD[11:10] = 00 (Continuous)
+ *   - CONV[7:5]  = 100 (~1 s update)
+ *   - AVG[9:8]   = 01 (8× internal averaging)
+ * Combined reset value: 0x0220.
+ * This matches TI docs and common libraries. We write it explicitly to avoid bitfield mistakes.
+ */
+static bool configureTMP117_Default() {
+  return writeReg16(REG_CONFIG, 0x0220);
+}
+
+// ---------- Rolling window stats (size = WINDOW_SAMPLES) ----------
+struct RollingStats {
+  float buf[WINDOW_SAMPLES];
+  uint16_t count = 0;
+  uint16_t head  = 0;
+  double sum     = 0.0;
+  double sumsq   = 0.0;
+
+  void reset() {
+    count = head = 0; sum = sumsq = 0.0;
+  }
+
+  void push(float v) {
+    if (count < WINDOW_SAMPLES) {
+      buf[head++] = v;
+      sum   += v;
+      sumsq += (double)v * v;
+      count++;
+      if (head >= WINDOW_SAMPLES) head = 0;
+    } else {
+      // overwrite oldest
+      uint16_t idx = head;
+      float old = buf[idx];
+      buf[idx] = v;
+      head = (head + 1) % WINDOW_SAMPLES;
+
+      sum   += v - old;
+      sumsq += (double)v * v - (double)old * old;
+    }
+  }
+
+  float mean() const {
+    return (count > 0) ? (float)(sum / (double)count) : NAN;
+  }
+
+  float stddev() const {
+    if (count == 0) return NAN;
+    double m = sum / count;
+    double var = (sumsq / count) - (m * m);
+    if (var < 0) var = 0; // guard for FP precision
+    return (float)sqrt(var);
+  }
+
+  float minVal() const {
+    if (count == 0) return NAN;
+    float mn = buf[0];
+    for (uint16_t i = 1; i < count; i++) mn = min(mn, buf[i]);
+    return mn;
+  }
+
+  float maxVal() const {
+    if (count == 0) return NAN;
+    float mx = buf[0];
+    for (uint16_t i = 1; i < count; i++) mx = max(mx, buf[i]);
+    return mx;
+  }
+};
+
+RollingStats stats;
+float lastReading = NAN;  // for ΔT/Δt
+
+// ---------- UI helpers ----------
+void drawRoundedRect(int x, int y, int w, int h, uint16_t colOutline, uint16_t colFill, int r = 6) {
+  sprite.fillRoundRect(x, y, w, h, r, colFill);
+  sprite.drawRoundRect(x, y, w, h, r, colOutline);
+}
+
+void drawProgressBar(int x, int y, int w, int h, float frac, uint16_t colBar, uint16_t colBg, uint16_t colOutline) {
+  if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+  sprite.drawRect(x - 1, y - 1, w + 2, h + 2, colOutline);
+  sprite.fillRect(x, y, w, h, colBg);
+  int fillw = (int)(w * frac + 0.5f);
+  if (fillw > 0) sprite.fillRect(x, y, fillw, h, colBar);
+}
+
+void drawHeader() {
+  sprite.setTextDatum(TC_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.setTextSize(2);
+  sprite.drawString("TMP117 — T‑Display S3 Long", 320, TITLE_Y);
+}
+
+void drawSpecCard() {
+  // Left spec + accuracy
+  drawRoundedRect(CARD_X, CARD_Y, CARD_W, CARD_H, COL_FRAME, COL_PANEL, 8);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Operating Profile", CARD_X + 10, CARD_Y + 8);
+
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  int ty = CARD_Y + 28;
+  sprite.drawString("Conversion Time:", CARD_X + 10, ty);
+  sprite.setTextColor(COL_ACCENT, COL_PANEL); sprite.drawString("1 s", CARD_X + 140, ty); ty += 16;
+
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("Warm-up Duration:", CARD_X + 10, ty);
+  sprite.setTextColor(COL_ACCENT, COL_PANEL); sprite.drawString("30–60 s", CARD_X + 140, ty); ty += 16;
+
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("Averaging Window:", CARD_X + 10, ty);
+  sprite.setTextColor(COL_ACCENT, COL_PANEL); sprite.drawString("~60 s", CARD_X + 140, ty); ty += 16;
+
+  // Accuracy (TMP117 typical over −20…50 °C)
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("Est. Accuracy:", CARD_X + 10, ty);
+  sprite.setTextColor(COL_ACCENT, COL_PANEL); sprite.drawString("±0.1 °C (typ)", CARD_X + 120, ty); ty += 16;
+
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("TMP117 @ 1 Hz, 8× internal avg", CARD_X + 10, CARD_Y + CARD_H - 16);
+}
+
+void drawBigTemperature(float tC) {
+  // Big readout box (right side)
+  const int boxX = 240, boxY = 84, boxW = 390, boxH = 64;
+  drawRoundedRect(boxX, boxY, boxW, boxH, COL_FRAME, 0x0010 /*deep navy*/, 8);
+
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_ACCENT2, 0x0010);
+  sprite.setTextSize(7);
+
+  char buf[40];
+  if (!isnan(tC)) snprintf(buf, sizeof(buf), "%.4f °C", tC);
+  else            snprintf(buf, sizeof(buf), "--.-- °C");
+  sprite.drawString(buf, boxX + boxW/2, TEMP_Y);
+}
+
+void drawWarmupAndAveragingBars(uint32_t warmupElapsedMs, uint16_t samplesTaken) {
+  // Warm-up bar
+  float fWarm = min(1.0f, (float)warmupElapsedMs / (float)WARMUP_MS);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.setTextSize(1);
+  sprite.drawString("Warm‑up", PROG_X, PROG_Y_TOP - 12);
+  drawProgressBar(PROG_X, PROG_Y_TOP, PROG_W, PROG_H, fWarm, COL_GOOD, COL_BAR_BG, COL_FRAME);
+
+  // Averaging bar
+  float fAvg = min(1.0f, (float)samplesTaken / (float)WINDOW_SAMPLES);
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.drawString("Averaging", PROG_X, PROG_Y_BOT - 12);
+  drawProgressBar(PROG_X, PROG_Y_BOT, PROG_W, PROG_H, fAvg, COL_WARN, COL_BAR_BG, COL_FRAME);
+}
+
+void drawDerivedMetrics(float meanC, float currentC, float rateCps, float minC, float maxC, float sigmaC) {
+  // Right-side, below the big readout
+  const int colLeft = 250;
+  int y = AVG_Y - 20;
+
+  char buf[48];
+
+  // Average
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(2);
+  sprite.setTextColor(COL_WARN, COL_BG);
+  if (!isnan(meanC)) snprintf(buf, sizeof(buf), "Avg: %.4f °C", meanC);
+  else               snprintf(buf, sizeof(buf), "Avg: --.-- °C");
+  sprite.drawString(buf, colLeft, y); y += 20;
+
+  // Δ vs average
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.setTextSize(1);
+  float delta = (!isnan(meanC) && !isnan(currentC)) ? (currentC - meanC) : NAN;
+  if (!isnan(delta)) snprintf(buf, sizeof(buf), "Δ vs avg: %+0.4f °C", delta);
+  else               snprintf(buf, sizeof(buf), "Δ vs avg: --.-- °C");
+  sprite.drawString(buf, colLeft, y); y += 14;
+
+  // Rate of change
+  if (!isnan(rateCps)) snprintf(buf, sizeof(buf), "Rate: %+0.4f °C/s", rateCps);
+  else                 snprintf(buf, sizeof(buf), "Rate: --.-- °C/s");
+  sprite.drawString(buf, colLeft, y); y += 14;
+
+  // Min / Max in window
+  if (!isnan(minC) && !isnan(maxC)) snprintf(buf, sizeof(buf), "Min/Max: %.4f / %.4f °C", minC, maxC);
+  else                              snprintf(buf, sizeof(buf), "Min/Max: --.-- / --.-- °C");
+  sprite.drawString(buf, colLeft, y); y += 14;
+
+  // Standard deviation
+  if (!isnan(sigmaC)) snprintf(buf, sizeof(buf), "σ: %.4f °C", sigmaC);
+  else                snprintf(buf, sizeof(buf), "σ: --.-- °C");
+  sprite.drawString(buf, colLeft, y);
+
+  // Sample counter (right)
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString(String("N = ") + String(stats.count) + " / " + String(WINDOW_SAMPLES), 630, y);
+}
+
+void drawStatusRibbon(const char* status) {
+  const int rx = 10, ry = CARD_Y + CARD_H + 4, rw = 210, rh = 16;
+  drawRoundedRect(rx, ry, rw, rh, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.setTextSize(1);
+  sprite.drawString(status, rx + rw/2, ry + rh/2);
+}
+
+void drawFrame(const char* status, float tC, uint32_t warmupElapsedMs) {
+  // Compute all derived metrics from the rolling stats
+  float meanC  = stats.mean();
+  float sigmaC = stats.stddev();
+  float minC   = stats.minVal();
+  float maxC   = stats.maxVal();
+  float rate   = (!isnan(lastReading) && !isnan(tC)) ? (tC - lastReading) / (CONV_INTERVAL_MS / 1000.0f) : NAN;
+
+  sprite.fillSprite(COL_BG);
+  drawHeader();
+  drawSpecCard();
+  drawWarmupAndAveragingBars(warmupElapsedMs, stats.count);
+  drawBigTemperature(tC);
+  drawDerivedMetrics(meanC, tC, rate, minC, maxC, sigmaC);
+  drawStatusRibbon(status);
+
+  // Push to panel (rotate to match 180x640 layout)
+  lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+}
+
+// ============================ SETUP / LOOP ============================
+
+void setup() {
+  Serial.begin(115200);
+
+  // Backlight off during init
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);
+
+  // Init panel & sprite
+  axs15231_init();
+  sprite.createSprite(640, 180);
+  sprite.setSwapBytes(1);
+  lcd_fill(0, 0, 180, 640, 0x0000);
+  digitalWrite(TFT_BL, HIGH);
+
+  // I2C init
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  // Device ID check
+  uint16_t id = 0;
+  const char* status = "TMP117 OK";
+  if (!readReg16(REG_DEVICE_ID, id) || id != 0x0117) {
+    status = "TMP117 ID mismatch";
+  }
+
+  // Configure TMP117 to its datasheet reset profile (Continuous, 1 s, 8×)
+  if (!configureTMP117_Default()) {
+    status = "Config write failed";
+  }
+
+  stats.reset();
+  lastReading = NAN;
+
+  // Warm-up phase
+  uint32_t tStart = millis();
+  while (millis() - tStart < WARMUP_MS) {
+    drawFrame("Warming up…", NAN, millis() - tStart);
+    delay(120);
+  }
+}
+
+void loop() {
+  // Read one new sample every 1 s and update rolling window
+  delay(CONV_INTERVAL_MS);
+
+  uint16_t raw;
+  if (!readReg16(REG_TEMP_RESULT, raw)) {
+    drawFrame("I2C read error", lastReading, WARMUP_MS);
+    return;
+  }
+
+  float tC = rawToC(raw);
+
+  // Update rolling stats
+  stats.push(tC);
+
+  // Update UI
+  drawFrame("Running", tC, WARMUP_MS);
+
+  // Remember for rate calculation
+  lastReading = tC;
+}
