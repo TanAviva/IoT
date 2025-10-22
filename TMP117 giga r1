@@ -1,68 +1,126 @@
-#include <Wire.h>
-#include <SparkFunTMP117.h>  // SparkFun TMP117 library
+// GIGA R1 ↔ TMP117 via Software I2C (accuracy-optimized)
+// Replaces Wire.h (hardware I2C) with SoftwareWire (software/bitbanged I2C on any pins)
 
-// Default I2C address for TMP117 (ADR pin floating): 0x48
-#define TMP117_ADDR 0x48
+#include <SoftwareWire.h>  // Library Manager: "SoftwareWire" by Testato/Koepel
 
-SFE_TMP117 tmp117;
+// ====== TMP117 registers & address ======
+#define TMP117_ADDR      0x48
+#define REG_TEMP_RESULT  0x00
+#define REG_CONFIG       0x01
+#define REG_DEVICE_ID    0x0F
 
-constexpr uint32_t WARMUP_MS   = 60UL * 1000UL; // 60 s warm-up
-constexpr uint16_t AVG_COUNT   = 60;            // average 60 readings
-constexpr uint32_t PRINT_EVERY = 1000UL;        // 1 s between reads
+// ====== Timing / averaging ======
+constexpr uint32_t WARMUP_MS = 60UL * 1000UL;
+constexpr uint16_t AVG_COUNT = 60;
+constexpr uint32_t INTERVAL  = 1000UL; // 1 s
+
+// ====== Choose software I2C pins (change if you like) ======
+constexpr uint8_t SDA_PIN = 8;   // e.g., D8
+constexpr uint8_t SCL_PIN = 9;   // e.g., D9
+
+// Create software I2C master on the chosen pins
+SoftwareWire WireSoft(SDA_PIN, SCL_PIN); // SDA, SCL
+// ---- Helper: write 16-bit big-endian to a register ----
+bool writeReg16(uint8_t reg, uint16_t value) {
+  WireSoft.beginTransmission(TMP117_ADDR);
+  WireSoft.write(reg);
+  WireSoft.write(value >> 8);       // MSB first
+  WireSoft.write(value & 0xFF);     // LSB
+  return (WireSoft.endTransmission() == 0);
+}
+
+// ---- Helper: read 16-bit big-endian from a register ----
+bool readReg16(uint8_t reg, uint16_t &value) {
+  WireSoft.beginTransmission(TMP117_ADDR);
+  WireSoft.write(reg);
+  if (WireSoft.endTransmission(false) != 0) return false; // repeated START
+
+  if (WireSoft.requestFrom((int)TMP117_ADDR, 2) != 2) return false;
+  uint8_t msb = WireSoft.read();
+  uint8_t lsb = WireSoft.read();
+  value = ((uint16_t)msb << 8) | lsb;
+  return true;
+}
+
+// Build CONFIG for: continuous conversion, 1 s conversion time, 8× averaging.
+// Datasheet fields: AVG at [10:9], CONV at [7:5], MODE at [4].
+uint16_t makeConfig() {
+  const uint16_t AVG_8X    = (1u << 9);  // 01b at [10:9] = 8×
+  const uint16_t CONV_1S   = (4u << 5);  // 100b at [7:5] = 1 s
+  const uint16_t MODE_CONT = (0u << 4);  // 0 = continuous
+  const uint16_t DEFAULTS  = 0x0000;
+  return (DEFAULTS | AVG_8X | CONV_1S | MODE_CONT);
+}
+
+// Convert raw 16-bit temperature to Celsius (LSB = 0.0078125 °C)
+double rawToC(uint16_t raw) {
+  int16_t s = (int16_t)raw;          // two's complement sign extend
+  return (double)s * 0.0078125;      // 1/128 °C per LSB
+}
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { ; }
+  while (!Serial) {;}
 
-  // Start I2C
-  Wire.begin();
-  Wire.setClock(400000); // Fast-mode I2C (optional; TMP117 supports it)
+  Serial.println("TMP117 via Software I2C on D8(SDA)/D9(SCL)");
 
-  Serial.println("TMP117 accuracy-optimized setup (1 s conversion, 60 s warm-up + average)");
+  // Start the software I2C bus
+  WireSoft.begin();
+  // Optional: some SoftwareWire versions support setClock(); if available, keep ~100 kHz
+  // WireSoft.setClock(100000);
 
-  // Initialize TMP117 at a known address
-  if (!tmp117.begin(TMP117_ADDR, Wire)) {
-    Serial.println("ERROR: TMP117 not found. Check wiring/address.");
+  // Read device ID (expect 0x0117)
+  uint16_t id;
+  if (!readReg16(REG_DEVICE_ID, id)) {
+    Serial.println("ERROR: Could not read Device ID. Check wiring/address.");
+    while (1) delay(1000);
+  } else {
+    Serial.print("Device ID: 0x"); Serial.println(id, HEX);
+    if (id != 0x0117) {
+      Serial.println("WARNING: Unexpected ID (expected 0x0117).");
+    }
+  }
+
+  // Configure: continuous, 1 s conversion, 8× averaging
+  uint16_t cfg = makeConfig();
+  if (!writeReg16(REG_CONFIG, cfg)) {
+    Serial.println("ERROR: Failed to write CONFIG.");
     while (1) delay(1000);
   }
 
-  // Set conversion cycle to 1 Hz (1-second conversion time)
-  // Library call names may be: setConversionCycle(TMP117_CONV_1HZ) or setConversionMode, depending on library version.
-  // The following variants are commonly supported:
-  bool ok = true;
-  ok &= tmp117.setConversionMode(TMP117_CONTINUOUS); // Continuous conversions
-  ok &= tmp117.setConversionAverageMode(TMP117_AVG_8); // Optional: internal averaging (if available)
-  ok &= tmp117.setConversionCycle(TMP117_CONV_1HZ);    // 1 s per conversion
-
-  if (!ok) {
-    Serial.println("WARNING: One or more configuration calls failed; proceeding with defaults.");
-  }
-
-  // Warm-up period to reach thermal equilibrium
+  // Warm-up to reach thermal equilibrium
   Serial.println("Warming up for 60 seconds...");
   delay(WARMUP_MS);
 
-  // Discard the very first post-warm reading (just to be safe)
-  (void) tmp117.getTemperature();
+  // Discard the very first reading after warm-up
+  uint16_t r;
+  readReg16(REG_TEMP_RESULT, r);
+
+  Serial.println("Starting 60-s averaging at 1-s interval...");
 }
 
 void loop() {
-  // Average 60 readings taken once per second
-  double sumC = 0.0;
+  double sum = 0.0;
+
   for (uint16_t i = 0; i < AVG_COUNT; i++) {
-    // Wait for conversion complete (library polls or we can delay)
-    // Many TMP117 libs support dataReady(). If present, prefer that:
-    // while (!tmp117.dataReady()) { delay(1); }
+    // Wait for next conversion (~1 s). Alternatively, poll the data-ready flag in CONFIG.
+    delay(INTERVAL);
 
-    double tC = tmp117.getTemperature(); // returns Celsius
-    sumC += tC;
-    delay(PRINT_EVERY);
+    uint16_t raw;
+    if (!readReg16(REG_TEMP_RESULT, raw)) {
+      Serial.println("Read error");
+      continue;
+    }
+    double c = rawToC(raw);
+    sum += c;
+
+    // Optional live print
+    // Serial.print("T = "); Serial.print(c, 4); Serial.println(" °C");
   }
-  double avgC = sumC / AVG_COUNT;
 
-  // Print with full sensor resolution (0.0078125°C steps) but remember accuracy is ±0.1°C typ.
-  Serial.print("Averaged temperature (60s @1s conv): ");
-  Serial.print(avgC, 4); // 4 decimals shows the 1/128°C resolution neatly
+  double avgC = sum / AVG_COUNT;
+  Serial.print("Averaged temperature (60s @1s conv, 8× avg): ");
+  Serial.print(avgC, 4);
   Serial.println(" °C");
 }
 ``
