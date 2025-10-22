@@ -1,0 +1,346 @@
+/*
+ * Nicla Sense Env → T‑Display S3 Long (ESP32‑S3 + AXS15231B, 180×640)
+ * Features:
+ *  - Indoor IAQ mode (ZMOD4410): TVOC, eCO2, Indoor IAQ, odor/ethanol indices
+ *  - Outdoor AQ mode (ZMOD4510): NO2, O3, Outdoor AQ
+ *  - HS4001: Temperature / Humidity
+ *  - RGB LED feedback on Nicla (AQ category color)
+ *  - Mode selection via KEY button (toggle Indoor/Outdoor)
+ *  - Long‑press KEY starts a Cleaning pulse (then returns to mode)
+ *  - Warm‑up/Stabilization banner for IAQ baseline (~15 min)
+ *
+ * References:
+ *  - Nicla Sense Env User Manual (host/shield via I2C/ESLOV)        [1]
+ *  - Environmental Monitor note (Outdoor AQ metrics & LED idea)     [2]
+ *  - Elevator Monitoring note (Indoor IAQ set & presentation)       [3]
+ *  - Arduino_NiclaSenseEnv library (API over I2C)                    [4]
+ *  - ZMOD4410 baseline stabilization discussion (~15 min typical)   [5]
+ *
+ * [1] https://docs.arduino.cc/tutorials/nicla-sense-env/user-manual/
+ * [2] https://docs.arduino.cc/tutorials/nicla-sense-env/environmental-monitor-application-note/
+ * [3] https://docs.arduino.cc/tutorials/nicla-sense-env/elevator-monitoring-application-note/
+ * [4] https://github.com/arduino-libraries/Arduino_NiclaSenseEnv
+ * [5] https://community.renesas.com/analog-products/sensors/f/support/34951/zmod4410-reduce-warm-up
+ */
+
+// -------------------- Includes --------------------
+#include "AXS15231B.h"             // LilyGO AXS driver (from T-Display-S3-Long repo /lib)
+#include <Arduino.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <Arduino_NiclaSenseEnv.h> // Official Arduino library for Nicla Sense Env
+
+// -------------------- I2C Pins --------------------
+// A) Common on many T‑Display S3 Long setups:
+#define I2C_SDA_PIN 15
+#define I2C_SCL_PIN 10
+// B) If you use on‑board Qwiic header (some revisions):
+// #define I2C_SDA_PIN 43
+// #define I2C_SCL_PIN 44
+
+// -------------------- Buttons ---------------------
+// KEY on many S3 Long variants (change if your board differs)
+#define PIN_KEY  14     // if you have a different KEY pin, set it here
+#define KEY_ACTIVE_LOW  1
+
+// -------------------- Objects ---------------------
+TFT_eSPI tft(180, 640);
+TFT_eSprite sprite(&tft);
+NiclaSenseEnv nicla(Wire);
+
+// -------------------- Theme -----------------------
+#define COL_BG     0x0000
+#define COL_PANEL  0x0842
+#define COL_FRAME  0x3186
+#define COL_TEXT   0xFFFF
+#define COL_MUTED  0xAD55
+#define COL_ACCENT 0xFDA0
+#define COL_CYAN   0x07FF
+#define COL_WARN   0xFFE0
+#define COL_GOOD   0x07E0
+#define COL_BAD    0xF800
+#define COL_BARBG  0x0841
+
+// -------------------- Modes -----------------------
+enum UIMode : uint8_t { MODE_INDOOR = 0, MODE_OUTDOOR = 1 };
+UIMode currentMode = MODE_INDOOR;
+
+// IAQ warm-up (ZMOD4410 baseline stabilization)
+const uint32_t IAQ_STABILIZE_MS = 15UL * 60UL * 1000UL; // ~15 minutes [5]
+uint32_t modeStartMs = 0;
+
+// Button handling
+uint32_t lastKeyChangeMs = 0;
+bool lastKeyLevel = true;
+bool longPressArmed = false;
+
+// Sampling cadence
+const uint32_t SAMPLE_MS = 1000;
+
+// -------------------- Small UI helpers ------------
+void panel(int x,int y,int w,int h,uint16_t outline,uint16_t fill,int r=6){
+  sprite.fillRoundRect(x,y,w,h,r,fill);
+  sprite.drawRoundRect(x,y,w,h,r,outline);
+}
+void labelValTL(const char* label, const String& val, int x, int y, uint16_t col=COL_TEXT){
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString(label, x, y);
+  sprite.setTextSize(2);
+  sprite.setTextColor(col, COL_BG);
+  sprite.drawString(val, x, y+14);
+}
+uint16_t colorAQ(float idx){
+  if (isnan(idx)) return COL_MUTED;
+  if (idx <= 50)  return COL_GOOD;  // good
+  if (idx <= 100) return COL_WARN;  // moderate
+  return COL_BAD;                   // poor
+}
+
+// Convert 16‑bit 565 color → 8‑bit RGB for Nicla LED
+void rgb565_to_888(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b){
+  r = ((c >> 11) & 0x1F) * 255 / 31;
+  g = ((c >>  5) & 0x3F) * 255 / 63;
+  b = ((c >>  0) & 0x1F) * 255 / 31;
+}
+
+// -------------------- Nicla helpers (modes/LED) ---
+// NOTE: The library exposes mode/LED control. If function names differ
+// in your installed version, open File → Examples → Arduino_NiclaSenseEnv
+// and adapt the calls below accordingly. [4]
+
+// Set Indoor mode (IAQ 2G) and Outdoor mode (OAQ). Return success.
+bool setIndoorMode(){
+  // Example API – adjust to your library’s examples
+  // return nicla.setIndoorMode(NSE_INDOOR_IAQ_2G);
+  // If your lib uses strings or enums, adapt here:
+  return nicla.setIndoorAirQualityMode(); // <— adjust if needed (placeholder)
+}
+bool setOutdoorMode(){
+  // return nicla.setOutdoorMode(NSE_OUTDOOR_AQ);
+  return nicla.setOutdoorAirQualityMode(); // <— adjust if needed (placeholder)
+}
+bool startCleaningPulse(){
+  // Some libs expose cleaning for each sensor, e.g. nicla.cleanIndoor(), cleanOutdoor()
+  // Here we try a combined cleaning; adapt per your examples.
+  return nicla.startCleaning(); // <— adjust if needed (placeholder)
+}
+void setNiclaLed565(uint16_t c){
+  uint8_t r,g,b; rgb565_to_888(c, r,g,b);
+  // Example: nicla.setRgbLed(r,g,b);  // 0..255
+  nicla.setRgbLed(r,g,b); // <— adjust if needed (placeholder)
+}
+void setNiclaLedOff(){
+  nicla.setRgbLed(0,0,0); // <— adjust if needed (placeholder)
+}
+
+// -------------------- UI sections -----------------
+void drawHeader(){
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.setTextSize(2);
+  sprite.drawString("Nicla Sense Env — T‑Display S3 Long", 10, 6);
+
+  // Mode badge (top-right)
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString("Mode:", 630, 8);
+  sprite.setTextColor(COL_ACCENT, COL_BG);
+  sprite.drawString(currentMode == MODE_INDOOR ? "Indoor IAQ" : "Outdoor AQ", 630, 24);
+}
+
+void drawLeftCard(){
+  panel(10, 34, 220, 140, COL_FRAME, COL_PANEL, 8);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Sensors / Links", 20, 42);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("HS4001: Temp / Humidity", 20, 58);
+  sprite.drawString("ZMOD4410: TVOC, eCO2, IAQ", 20, 74);
+  sprite.drawString("ZMOD4510: NO2, O3, OAQ",    20, 90);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("I2C (ESLOV) @ 3.3V", 20, 108);
+  sprite.drawString("Arduino_NiclaSenseEnv", 20, 124);
+}
+
+void drawBigTRH(float tC, float rh){
+  panel(240, 40, 390, 70, COL_FRAME, 0x0010, 8);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_CYAN, 0x0010);
+  sprite.setTextSize(4);
+  char buf[64];
+  if (!isnan(tC) && !isnan(rh)) snprintf(buf, sizeof(buf), "%.2f °C  |  %.1f %%RH", tC, rh);
+  else snprintf(buf, sizeof(buf), "--.-- °C  |  --.- %%RH");
+  sprite.drawString(buf, 240+195, 40+35);
+}
+
+void drawIndoorSet(float tvoc_ppb, float eco2_ppm, float iaq, float odor, float ethanol){
+  labelValTL("Indoor IAQ",  isnan(iaq)  ? "--" : String(iaq,1), 240, 118, colorAQ(iaq));
+  labelValTL("TVOC (ppb)",  isnan(tvoc_ppb) ? "--" : String(tvoc_ppb,0), 240, 150);
+  labelValTL("eCO2 (ppm)",  isnan(eco2_ppm) ? "--" : String(eco2_ppm,0), 420, 150);
+  labelValTL("Odor idx",    isnan(odor)     ? "--" : String(odor,2),     240, 186);
+  labelValTL("Ethanol idx", isnan(ethanol)  ? "--" : String(ethanol,2),  420, 186);
+}
+
+void drawOutdoorSet(float no2_ppb, float o3_ppb, float oaq){
+  labelValTL("Outdoor AQ",  isnan(oaq) ? "--" : String(oaq,1),  420, 118, colorAQ(oaq));
+  labelValTL("NO2 (ppb)",   isnan(no2_ppb) ? "--" : String(no2_ppb,0), 240, 222);
+  labelValTL("O3  (ppb)",   isnan(o3_ppb)  ? "--" : String(o3_ppb,0),  420, 222);
+}
+
+void drawStabilizationBanner(){
+  // Visible only in Indoor mode while within the stabilization window
+  if (currentMode != MODE_INDOOR) return;
+  uint32_t elapsed = millis() - modeStartMs;
+  if (elapsed >= IAQ_STABILIZE_MS) return;
+  uint32_t remain = (IAQ_STABILIZE_MS - elapsed + 999)/1000;
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Stabilizing IAQ baseline… %lu s", (unsigned long)remain);
+
+  const int x=10, y=180-22, w=220, h=16;
+  panel(x,y,w,h, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.setTextSize(1);
+  sprite.drawString(msg, x+w/2, y+h/2);
+}
+
+void drawFrame(
+  float tC, float rh,
+  float tvoc_ppb, float eco2_ppm, float iaq, float odor, float ethanol,
+  float no2_ppb, float o3_ppb, float oaq
+){
+  sprite.fillSprite(COL_BG);
+  drawHeader();
+  drawLeftCard();
+  drawBigTRH(tC, rh);
+
+  // Show both blocks but emphasize the active mode with color accents already handled above.
+  drawIndoorSet(tvoc_ppb, eco2_ppm, iaq, odor, ethanol);
+  drawOutdoorSet(no2_ppb, o3_ppb, oaq);
+
+  drawStabilizationBanner();
+
+  // Push (rotated) to the 180×640 panel
+  lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+}
+
+// -------------------- Mode & LED logic ------------
+void applyMode(UIMode m){
+  currentMode = m;
+  modeStartMs = millis();
+
+  bool ok = false;
+  if (currentMode == MODE_INDOOR) ok = setIndoorMode();  // IAQ mode [3]
+  else                            ok = setOutdoorMode(); // OAQ mode [2]
+  if (!ok) Serial.println("WARN: set mode failed (adjust API names per examples).");
+}
+
+void applyRgbFeedback(float indoorIAQ, float outdoorAQ){
+  // If in warm-up for Indoor IAQ, LED = cyan (stabilizing). Else map current mode AQ to color.
+  if (currentMode == MODE_INDOOR){
+    if (millis() - modeStartMs < IAQ_STABILIZE_MS){
+      setNiclaLed565(COL_CYAN);
+      return;
+    }
+    setNiclaLed565(colorAQ(indoorIAQ));
+  } else {
+    setNiclaLed565(colorAQ(outdoorAQ));
+  }
+}
+
+// -------------------- KEY handling ----------------
+bool keyRead(){
+  bool level = digitalRead(PIN_KEY);
+  return KEY_ACTIVE_LOW ? !level : level;
+}
+void handleKey(){
+  bool k = keyRead();
+  uint32_t now = millis();
+
+  if (k != lastKeyLevel && (now - lastKeyChangeMs) > 30){
+    lastKeyChangeMs = now;
+    lastKeyLevel = k;
+
+    if (k){ // pressed
+      longPressArmed = true;
+    }else{  // released
+      if (longPressArmed && (now - lastKeyChangeMs) < 1500){
+        // short press → toggle mode
+        applyMode(currentMode == MODE_INDOOR ? MODE_OUTDOOR : MODE_INDOOR);
+      }
+      longPressArmed = false;
+    }
+  }
+
+  // long press check
+  if (longPressArmed && (now - lastKeyChangeMs) >= 1500){
+    longPressArmed = false;
+    // Cleaning pulse
+    bool ok = startCleaningPulse();
+    if (!ok) Serial.println("WARN: cleaning pulse failed (adjust API per lib examples).");
+  }
+}
+
+// -------------------- Setup -----------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Display init
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);
+  axs15231_init();
+  sprite.createSprite(640, 180);
+  sprite.setSwapBytes(1);
+  lcd_fill(0, 0, 180, 640, 0x0000);
+  digitalWrite(TFT_BL, HIGH);
+
+  // I2C init
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  // KEY button
+  pinMode(PIN_KEY, KEY_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+
+  // Nicla begin
+  if (!nicla.begin()){
+    sprite.fillSprite(COL_BG);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(COL_BAD, COL_BG);
+    sprite.setTextSize(2);
+    sprite.drawString("Nicla Sense Env not found (I2C)", 320, 90);
+    lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+    delay(3000);
+  }
+
+  // Default to Indoor mode (as per elevator note). You can change to Outdoor if desired. [3]
+  applyMode(MODE_INDOOR);
+  setNiclaLed565(COL_CYAN); // show "active" at startup
+}
+
+// -------------------- Loop ------------------------
+void loop() {
+  handleKey();
+
+  // Read all metrics (adjust method names if your library differs) [4]
+  float tC     = nicla.readTemperature();
+  float rh     = nicla.readHumidity();
+
+  float tvoc   = nicla.readTVOC();
+  float eco2   = nicla.readECO2();
+  float iaq    = nicla.readIndoorAirQuality();
+  float odor   = nicla.readOdorIndex();
+  float ethanol= nicla.readEthanolIndex();
+
+  float no2    = nicla.readNO2();
+  float o3     = nicla.readO3();
+  float oaq    = nicla.readOutdoorAirQuality();
+
+  applyRgbFeedback(iaq, oaq);
+  drawFrame(tC, rh, tvoc, eco2, iaq, odor, ethanol, no2, o3, oaq);
+
+  delay(SAMPLE_MS);
+}
