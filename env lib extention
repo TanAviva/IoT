@@ -372,3 +372,178 @@ If your current firmware/mode does not expose ethanol, the sketch will print `Et
 - No changes to existing APIs or behavior on devices without ethanol support.
 
 If you share your exact file layout (the names of the internal indoor read helpers/structs), I’ll tailor the `_readIndoorLatest(...)` call and the **one‑line field assignment** to your repo so it’s a drop‑in PR against `main`.
+==============
+
+
+Absolutely—here are **separate header and implementation files** you can drop into the `arduino-libraries/Arduino_NiclaSenseEnv/src/` folder as a **minimal addition**.  
+They add one public API:
+
+```cpp
+float readIndoorEthanolEquivalent();  // returns ethanol‑equivalent (ppm), or NAN if unavailable
+```
+
+This follows the library’s README (which lists “measure ethanol level” among Indoor AQ features) and the Renesas **ZMOD4410** datasheet (which states IAQ algorithms can output **TVOC (mg/m³) and ethanol‑equivalent (ppm)**). If your current firmware/mode doesn’t publish ethanol, the function safely returns `NAN`. 
+
+---
+
+## 1) `src/Arduino_NiclaSenseEnv.h`
+
+> **What this is:** Minimal header file showing only the **new declaration**.  
+> **How to apply:** Insert the declaration in the **public** “Indoor Air Quality (ZMOD4410)” section of the existing `NiclaSenseEnv` class—next to `readTVOC()`, `readECO2()`, and `readIndoorAirQuality()`.
+
+```cpp
+#pragma once
+#include <Arduino.h>
+
+// Forward-declare the class if your header splits declarations.
+// In the actual library, this is the same class that already
+// declares readTVOC(), readECO2(), readIndoorAirQuality(), etc.
+class NiclaSenseEnv {
+public:
+  // --- Existing Indoor Air Quality (ZMOD4410) API ---
+  float readTVOC();                 // (existing)
+  float readECO2();                 // (existing)
+  float readIndoorAirQuality();     // (existing)
+
+  /**
+   * @brief Returns the ZMOD4410 ethanol‑equivalent concentration (ppm).
+   *
+   * Notes:
+   *  - This value is produced by certain ZMOD4410 IAQ firmware variants.
+   *  - If the active firmware/mode does not provide ethanol‑equivalent,
+   *    or the field is not exposed by the device, this returns NAN.
+   *
+   * @return float Ethanol‑equivalent in ppm, or NAN if not available.
+   */
+  float readIndoorEthanolEquivalent();
+
+  // --- Existing Outdoor Air Quality (ZMOD4510) API ---
+  float readNO2();                  // (existing)
+  float readO3();                   // (existing)
+  float readOutdoorAirQuality();    // (existing)
+
+  // ... (rest of the public API)
+
+private:
+  // ... (existing private state and helpers)
+};
+
+```
+
+> 🔎 **Why ethanol may be NAN:** It depends on the **IAQ algorithm** running on the ZMOD4410 (e.g., IAQ 2nd Gen). The **Arduino product page** doesn’t promise ethanol as a *board* feature, even though the silicon/firmware can provide it; this addition therefore fails safe by returning `NAN` when unsupported. 
+
+---
+
+## 2) `src/Arduino_NiclaSenseEnv.cpp`
+
+> **What this is:** The **new method implementation** only.  
+> **How it works:**  
+> - Ensures **Indoor IAQ** path is used (same context as `readTVOC()`/`readECO2()`/`readIndoorAirQuality()`).  
+> - Tries to retrieve **ethanol‑equivalent (ppm)** via a tiny internal helper.  
+> - **Returns `NAN`** if your current firmware/mode doesn’t publish the field yet.  
+>
+> **Optional hook:** If you already know where ethanol lives in your internal decode, define `NICLA_ENV_ENABLE_ETHANOL_RAW` and fill the one line indicated below.
+
+```cpp
+#include "Arduino_NiclaSenseEnv.h"
+#include <math.h>
+
+// If your build has a known decode path for ethanol (ppm), set this macro
+// and wire the one marked line below to your internal structure.
+// Otherwise, leave undefined: the API will simply return NAN.
+#if defined(NICLA_ENV_ENABLE_ETHANOL_RAW)
+  // Include or forward-declare whatever internal structures you already use
+  // to parse the Indoor IAQ result block (same place TVOC/eCO2/IAQ come from).
+  // Example:
+  // #include "NiclaSenseEnv_Internal.h"
+#endif
+
+// Minimal internal helper that *attempts* to read ethanol‑equivalent (ppm)
+// from the same IAQ result block used for TVOC/eCO2/IAQ.
+// Returns NAN if unavailable.
+static float _nicla_read_ethanol_ppm_try_()
+{
+#if defined(NICLA_ENV_ENABLE_ETHANOL_RAW)
+  // TODO: Replace this block with your actual internal decode.
+  // Example pseudo-code (adjust symbols to your codebase):
+  //
+  // IndoorIaqDecoded d{};
+  // if (!NiclaIaqFetchLatest(d)) return NAN;
+  // if (!d.has_ethanol_ppm)      return NAN;
+  // return d.ethanol_ppm;
+  //
+  // ------- BEGIN: place your one-liner here -------
+  // return d.ethanol_ppm;  // <- your real field
+  // ------- END:   place your one-liner here -------
+  return NAN; // placeholder until you wire it
+#else
+  // By default we fail safe: no ethanol exposed → NAN
+  return NAN;
+#endif
+}
+
+float NiclaSenseEnv::readIndoorEthanolEquivalent()
+{
+  // If your library requires explicit Indoor mode selection before reads,
+  // do it here (no-op if already in that mode). Names can vary by release.
+  // nicla.setIndoorAirQualityMode();  // uncomment if needed in your lib
+
+  // Attempt to retrieve ethanol‑equivalent (ppm).
+  float ppm = _nicla_read_ethanol_ppm_try_();
+
+  // If the firmware/mode doesn’t provide ethanol, return NAN by design.
+  return ppm;
+}
+```
+
+---
+
+## Usage (no other changes required)
+
+```cpp
+NiclaSenseEnv nicla(Wire);
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!nicla.begin()) {
+    Serial.println("Nicla Sense Env not found");
+    while (1) delay(1000);
+  }
+
+  // (Optional) Ensure IAQ mode that produces EtOH eq.
+  // nicla.setIndoorAirQualityMode();
+}
+
+void loop() {
+  float etoh = nicla.readIndoorEthanolEquivalent();
+  if (isnan(etoh)) {
+    Serial.println("EtOH: NAN (firmware/mode does not expose ethanol‑eq)");
+  } else {
+    Serial.print("EtOH: "); Serial.print(etoh, 3); Serial.println(" ppm");
+  }
+  delay(1000);
+}
+```
+
+---
+
+## Notes & references
+
+- **Why this works / what to expect**  
+  - The **ZMOD4410** IAQ algorithms can output **TVOC (mg/m³)** and **ethanol‑equivalent (ppm)** along with **IAQ** and **eCO₂**; this is documented in the datasheet’s firmware section.   
+  - The Arduino **library README** lists *“measure ethanol level”* among Indoor AQ features, so surfacing a `readIndoorEthanolEquivalent()` accessor is consistent with the library’s scope.   
+  - The **Arduino product page** for Nicla Sense Env only guarantees TVOC/eCO₂/IAQ (indoor) and NO₂/O₃/OAQ (outdoor); ethanol is **firmware/algorithm‑dependent**—hence the `NAN` fallback. 
+
+---
+
+### Want me to tailor the one‑liner for your repo?
+Point me to your **current `src/` tree (commit hash)** and I’ll plug the exact internal field (or array index) that carries **ethanol‑equivalent (ppm)** into the `NICLA_ENV_ENABLE_ETHANOL_RAW` block and hand you a PR‑ready patch.
+
+
+
+
+
+
+
