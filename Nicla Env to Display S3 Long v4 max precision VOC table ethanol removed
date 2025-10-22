@@ -1,0 +1,660 @@
+/*
+ * Nicla Sense Env → T‑Display S3 Long (ESP32‑S3 + AXS15231B, 180×640)
+ * Precision‑Max + Source‑Aware (+ optional Cloud Sender)
+ *
+ * This build strictly follows the official Nicla Sense Env feature set:
+ *  - Indoor (ZMOD4410): TVOC, eCO2 (estimated), IAQ index
+ *  - Outdoor (ZMOD4510): NO2, O3, Outdoor AQ index
+ *  - HS4001: Temperature & Humidity
+ *  - RGB/Orange LED control, mode selection, cleaning
+ * (Ethanol/Odor indices were removed.)
+ *
+ * Docs:
+ *  - Arduino Nicla Sense Env (features: TVOC/eCO2/IAQ; NO2/O3/OAQ; HS4001 T/RH):
+ *      https://docs.arduino.cc/hardware/nicla-sense-env/
+ *  - Arduino_NiclaSenseEnv library (I2C API: metrics, LEDs, modes, cleaning):
+ *      https://github.com/arduino-libraries/Arduino_NiclaSenseEnv
+ */
+
+// ========================== ==== USER CONFIG ==== ==========================
+
+// ---- Wi‑Fi (leave as-is if you disable cloud) ----
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
+
+// ---- Time (NTP) ----
+#define NTP_POOL        "pool.ntp.org"
+#define TZ_GMT_OFFSET_S 0
+#define TZ_DAYLIGHT_S   0
+
+// ---- Cloud Sender Mode ----
+#define CLOUD_USE_HTTP  1   // 1=HTTP/HTTPS POST; set 0 to disable
+#define CLOUD_USE_MQTT  0   // 1=MQTT publish;   set 0 to disable
+
+// ---- HTTP/HTTPS endpoint ----
+#define HTTP_ENDPOINT_URL   "https://example.com/api/v1/nicla/events"
+#define HTTP_API_KEY_HEADER "X-API-Key"
+#define HTTP_API_KEY_VALUE  "REPLACE_WITH_YOUR_API_KEY"
+
+// TLS root CA (optional). If empty, HTTPS uses insecure mode (test only).
+static const char* ROOT_CA_CERT = R"(-----BEGIN CERTIFICATE-----
+# Optional: paste your CA cert here; otherwise setInsecure() is used for HTTPS.
+-----END CERTIFICATE-----)";
+
+// ---- MQTT broker (if enabled) ----
+#define MQTT_BROKER_HOST "test.mosquitto.org"
+#define MQTT_BROKER_PORT 1883
+#define MQTT_USERNAME    ""   // optional
+#define MQTT_PASSWORD    ""   // optional
+#define MQTT_CLIENT_ID   "NiclaEnv_S3Long_01"
+#define MQTT_TOPIC       "nicla/env/events"
+
+// ---- Event queue/backoff ----
+#define MAX_EVENT_QUEUE    20
+#define INITIAL_BACKOFF_MS 3000UL
+#define MAX_BACKOFF_MS     120000UL
+
+// ========================== END USER CONFIG ===============================
+
+
+// -------------------- Includes --------------------
+#include "AXS15231B.h"
+#include <Arduino.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <Arduino_NiclaSenseEnv.h>
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#if CLOUD_USE_MQTT
+  #include <PubSubClient.h>
+#endif
+#include <time.h>
+
+// -------------------- I2C Pins --------------------
+// Common on many S3 Long builds:
+#define I2C_SDA_PIN 15
+#define I2C_SCL_PIN 10
+// If using Qwiic header on some revisions, use 43/44.
+
+// -------------------- Buttons ---------------------
+#define PIN_KEY  14
+#define KEY_ACTIVE_LOW  1
+
+// -------------------- Display / Objects -----------
+TFT_eSPI tft(180, 640);
+TFT_eSprite sprite(&tft);
+NiclaSenseEnv nicla(Wire);
+
+// -------------------- Theme -----------------------
+#define COL_BG     0x0000
+#define COL_PANEL  0x0842
+#define COL_FRAME  0x3186
+#define COL_TEXT   0xFFFF
+#define COL_MUTED  0xAD55
+#define COL_ACCENT 0xFDA0
+#define COL_CYAN   0x07FF
+#define COL_WARN   0xFFE0
+#define COL_GOOD   0x07E0
+#define COL_BAD    0xF800
+
+// -------------------- Modes -----------------------
+enum UIMode : uint8_t { MODE_INDOOR = 0, MODE_OUTDOOR = 1 };
+UIMode currentMode = MODE_INDOOR;
+
+// IAQ warm-up (~15 min for ZMOD4410 baseline)
+const uint32_t IAQ_STABILIZE_MS = 15UL * 60UL * 1000UL;
+uint32_t modeStartMs = 0;
+
+// -------------------- Sampling cadence ------------
+const uint32_t SAMPLE_MS = 1000;
+
+// -------------------- VOC thresholds --------------
+static const float TVOC_GOOD_MAX_PPB     = 300.0f;
+static const float TVOC_MODERATE_MAX_PPB = 1000.0f;
+static const float VOC_ALERT_TVOC_PPB    = 1000.0f;
+
+static const float IAQ_GOOD_MAX = 50.0f;
+static const float IAQ_MOD_MAX  = 100.0f;
+
+// -------------------- Button handling -------------
+uint32_t lastKeyChangeMs = 0; bool lastKeyLevel = true; bool longPressArmed = false;
+
+// -------------------- Stats & Filters -------------
+template<size_t N>
+struct RollingWindowStats {
+  float buf[N]; size_t count=0, head=0; double sum=0.0, sumsq=0.0;
+  void reset(){ count=0; head=0; sum=0.0; sumsq=0.0; }
+  void push(float v){
+    if (isnan(v)) return;
+    if (count < N){
+      buf[head++] = v; if (head>=N) head=0;
+      sum += v; sumsq += (double)v*v; count++;
+    } else {
+      float old = buf[head]; buf[head] = v; head = (head+1)%N;
+      sum += v - old; sumsq += (double)v*v - (double)old*old;
+    }
+  }
+  float mean() const { return (count>0) ? (float)(sum/(double)count) : NAN; }
+  float stddev() const {
+    if (count==0) return NAN;
+    double m = sum/(double)count; double var = (sumsq/(double)count) - m*m;
+    if (var<0) var=0; return (float)sqrt(var);
+  }
+};
+struct EmaFilter {
+  float alpha; bool have=false; float val=0; EmaFilter(float a=0.3f):alpha(a){}
+  void reset(){ have=false; val=0; }
+  void update(float x){ if (isnan(x)) return; if (!have){ val=x; have=true; } else { val = alpha*x + (1.0f-alpha)*val; } }
+  float value() const { return have ? val : NAN; }
+};
+
+RollingWindowStats<10> s_tC, s_rh, s_tvoc, s_eco2, s_iaq, s_no2, s_o3, s_oaq;
+EmaFilter f_tC(0.25f), f_rh(0.25f), f_tvoc(0.35f), f_eco2(0.35f),
+          f_iaq(0.35f), f_no2(0.35f), f_o3(0.35f), f_oaq(0.35f);
+
+struct LastRaw { bool have=false; uint32_t t=0; float tvoc=NAN, iaq=NAN, tC=NAN, rh=NAN; } lastRaw;
+
+int chooseDecimals(float mean, float sigma, int maxDp){
+  if (isnan(mean) || isnan(sigma) || maxDp<=0) return 0;
+  float absMean = fabsf(mean);
+  float rsd = (absMean > 1e-9f) ? (sigma/absMean) : sigma;
+  if (absMean <= 1e-6f) return min(3, maxDp);
+  if (rsd < 0.002f)     return min(3, maxDp);
+  if (rsd < 0.010f)     return min(2, maxDp);
+  if (rsd < 0.050f)     return min(1, maxDp);
+  return 0;
+}
+String fmtAdaptive(const EmaFilter& ema, const RollingWindowStats<10>& stats, int maxDp){
+  float v = ema.value(); if (isnan(v)) return String("--");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), maxDp); return String(v, dp);
+}
+String fmtT(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--.--");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), 3); dp = max(dp, 1); return String(v, dp);
+}
+String fmtRH(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--.-");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), 2); dp = max(dp, 1); return String(v, dp);
+}
+String fmtIndex(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--");
+  int dp = min(1, chooseDecimals(stats.mean(), stats.stddev(), 1)); return String(v, dp);
+}
+
+// -------------------- Source Hint Heuristics --------------------
+enum SourceClass : uint8_t { SRC_UNKNOWN=0, SRC_COOKING, SRC_SPRAY, SRC_CLEANING, SRC_OCCUPANCY };
+struct SourceHint { SourceClass cls=SRC_UNKNOWN; String label="—"; };
+
+// Heuristic thresholds
+const float SLOPE_SPRAY_FAST_PPBs   = 150.0f;      // fast dTVOC/dt for sprays/solvents
+const float COOK_T_RISE_MIN_C       = 0.20f;       // cooking heat signature
+const float COOK_RH_RISE_MIN        = 2.0f;        // cooking steam signature
+const float OCCUPANCY_RH_DRIFT_MIN  = 0.8f;        // occupancy RH creep
+const uint32_t CLEAN_DUR_MIN_MS     = 5UL*60UL*1000UL; // sustained elevation → cleaning
+const uint32_t SPRAY_DUR_MAX_MS     = 120UL*1000UL;    // brief burst window
+
+struct Drift2Min { bool have=false; uint32_t t0=0; float tC0=NAN, rh0=NAN, tvoc0=NAN; } drift2m;
+
+SourceHint classifySource(uint32_t nowMs, float tvoc, float iaq, float tC, float rh,
+                          bool alertActive, uint32_t alertElapsedMs){
+  SourceHint h;
+  // dTVOC/dt (ppb/s)
+  float dTVOC = NAN;
+  if (lastRaw.have){
+    float dt = (nowMs - lastRaw.t)/1000.0f;
+    if (dt > 0.1f && !isnan(tvoc) && !isnan(lastRaw.tvoc)) dTVOC = (tvoc - lastRaw.tvoc)/dt;
+  }
+  // 2‑minute drifts
+  if (!drift2m.have || nowMs - drift2m.t0 > 120000UL){
+    drift2m.have = true; drift2m.t0=nowMs; drift2m.tC0=tC; drift2m.rh0=rh; drift2m.tvoc0=tvoc;
+  }
+  float dT2m  = (!isnan(tC)  && !isnan(drift2m.tC0)) ? (tC  - drift2m.tC0)  : NAN;
+  float dRH2m = (!isnan(rh)  && !isnan(drift2m.rh0)) ? (rh  - drift2m.rh0)  : NAN;
+  float dV2m  = (!isnan(tvoc)&& !isnan(drift2m.tvoc0))? (tvoc- drift2m.tvoc0) : NAN;
+
+  // Spray/Perfume/Solvent: very fast TVOC burst + short duration
+  if (!isnan(dTVOC) && dTVOC > SLOPE_SPRAY_FAST_PPBs && alertElapsedMs <= SPRAY_DUR_MAX_MS){
+    h.cls = SRC_SPRAY; h.label = "Spray/Perfume/Solvent"; return h;
+  }
+  // Cooking heat/oils: elevated TVOC + ΔT or ΔRH over minutes
+  bool cookRise = (!isnan(dT2m) && dT2m >= COOK_T_RISE_MIN_C) || (!isnan(dRH2m) && dRH2m >= COOK_RH_RISE_MIN);
+  if (alertActive && cookRise && tvoc >= TVOC_GOOD_MAX_PPB){
+    h.cls = SRC_COOKING; h.label = "Cooking heat/oils"; return h;
+  }
+  // Cleaning/Air freshener: sustained elevation
+  if (alertActive && alertElapsedMs >= CLEAN_DUR_MIN_MS){
+    h.cls = SRC_CLEANING; h.label = "Cleaning / Air freshener"; return h;
+  }
+  // Occupancy: slow TVOC drift + RH creep
+  if ((!isnan(dRH2m) && dRH2m >= OCCUPANCY_RH_DRIFT_MIN) && (!isnan(dV2m) && dV2m > 0)){
+    h.cls = SRC_OCCUPANCY; h.label = "Human activity / occupancy"; return h;
+  }
+  return h;
+}
+
+// -------------------- VOC Event Logger --------------------
+struct VocEvent {
+  bool active=false; uint32_t tStart=0, tLast=0;
+  float peakTVOC=NAN; float maxIAQ=NAN;
+  SourceHint hint; String reason;
+};
+VocEvent currentEvt;
+
+// -------------------- Ventilation Reminder --------------------
+struct DecayTracker { bool havePeak=false; float peakVal=NAN; uint32_t tPeak=0; float lastVal=NAN; uint32_t lastT=0; } decay;
+const float DECAY_MIN_DROP_PER_MIN = 20.0f;
+bool ventilationSuggest=false; uint32_t ventilationLastTrigger=0; const uint32_t VENT_BANNER_HOLD_MS = 90UL*1000UL;
+
+void updateDecay(uint32_t nowMs, float tvoc, bool alertActive){
+  if (isnan(tvoc)) return;
+  if (alertActive){
+    if (!decay.havePeak || tvoc > decay.peakVal){ decay.havePeak=true; decay.peakVal=tvoc; decay.tPeak=nowMs; }
+  }
+  if (decay.havePeak){
+    if (decay.lastT==0 || nowMs - decay.lastT >= 60000UL){
+      decay.lastT = nowMs; decay.lastVal = tvoc;
+      float dtMin = (nowMs - decay.tPeak)/60000.0f;
+      if (dtMin > 0 && decay.peakVal > 0){
+        float dropPct = 100.0f*(decay.peakVal - tvoc)/decay.peakVal;
+        float dropPerMin = dropPct/dtMin;
+        if ((nowMs - decay.tPeak) > 120000UL && dropPerMin < DECAY_MIN_DROP_PER_MIN){
+          ventilationSuggest = true; ventilationLastTrigger = nowMs;
+        }
+        if (ventilationSuggest && (nowMs - ventilationLastTrigger) > VENT_BANNER_HOLD_MS) ventilationSuggest=false;
+        if (dropPct >= 70.0f) decay.havePeak=false;
+      }
+    }
+  } else ventilationSuggest=false;
+}
+
+// -------------------- UI helpers ---------------------
+void panel(int x,int y,int w,int h,uint16_t outline,uint16_t fill,int r=6){
+  sprite.fillRoundRect(x,y,w,h,r,fill); sprite.drawRoundRect(x,y,w,h,r,outline);
+}
+void labelValTL(const char* label, const String& val, int x, int y, uint16_t col=COL_TEXT){
+  sprite.setTextDatum(TL_DATUM); sprite.setTextSize(1); sprite.setTextColor(COL_MUTED, COL_BG); sprite.drawString(label, x, y);
+  sprite.setTextSize(2); sprite.setTextColor(col, COL_BG); sprite.drawString(val, x, y+14);
+}
+uint16_t colorAQ(float idx){
+  if (isnan(idx)) return COL_MUTED;
+  if (idx <= IAQ_GOOD_MAX) return COL_GOOD;
+  if (idx <= IAQ_MOD_MAX)  return COL_WARN;
+  return COL_BAD;
+}
+
+// ---------------- Nicla helpers ------------------
+bool setIndoorMode(){ return nicla.setIndoorAirQualityMode(); }   // adjust if your lib differs
+bool setOutdoorMode(){ return nicla.setOutdoorAirQualityMode(); } // adjust if your lib differs
+bool startCleaningPulse(){ return nicla.startCleaning(); }         // adjust if your lib differs
+void setNiclaLedRgb(uint8_t r, uint8_t g, uint8_t b){ nicla.setRgbLed(r,g,b); }
+void setNiclaLed565(uint16_t c){
+  uint8_t r = ((c >> 11) & 0x1F) * 255 / 31;
+  uint8_t g = ((c >>  5) & 0x3F) * 255 / 63;
+  uint8_t b = ((c >>  0) & 0x1F) * 255 / 31;
+  setNiclaLedRgb(r,g,b);
+}
+void setOrangeLed(bool on){
+  // If your lib lacks orange LED API, comment this out.
+  nicla.setOrangeLed(on);
+}
+
+// ---------------- UI sections ---------------------
+void drawHeader(){
+  sprite.setTextDatum(TL_DATUM); sprite.setTextColor(COL_TEXT, COL_BG); sprite.setTextSize(2);
+  sprite.drawString("Nicla Sense Env — Precision‑Max + Source (+ Cloud)", 10, 6);
+  sprite.setTextDatum(TR_DATUM); sprite.setTextSize(1); sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString("Mode:", 630, 8); sprite.setTextColor(COL_ACCENT, COL_BG);
+  sprite.drawString(currentMode == MODE_INDOOR ? "Indoor IAQ" : "Outdoor AQ", 630, 24);
+}
+void drawLeftCard(){
+  panel(10, 34, 220, 140, COL_FRAME, COL_PANEL, 8);
+  sprite.setTextDatum(TL_DATUM); sprite.setTextSize(1); sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Sensors / Links", 20, 42);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("HS4001: Temp / Humidity", 20, 58);
+  sprite.drawString("ZMOD4410: TVOC, eCO2, IAQ", 20, 74);
+  sprite.drawString("ZMOD4510: NO2, O3, OAQ",    20, 90);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("I2C (ESLOV) @ 3.3V", 20, 108);
+  sprite.drawString("HTTP/MQTT Cloud Sender", 20, 124);
+}
+void drawBigTRH(){
+  panel(240, 40, 390, 70, COL_FRAME, 0x0010, 8);
+  sprite.setTextDatum(MC_DATUM); sprite.setTextColor(COL_CYAN, 0x0010); sprite.setTextSize(4);
+  String sT = fmtT(f_tC, s_tC); String sH = fmtRH(f_rh, s_rh);
+  char buf[96]; snprintf(buf, sizeof(buf), "%s °C  |  %s %%RH", sT.c_str(), sH.c_str());
+  sprite.drawString(buf, 240+195, 40+35);
+}
+void drawIndoorSet(){
+  labelValTL("Indoor IAQ",  fmtIndex(f_iaq, s_iaq), 240, 118, colorAQ(f_iaq.value()));
+  labelValTL("TVOC (ppb)",  fmtAdaptive(f_tvoc,  s_tvoc, 2), 240, 150);
+  labelValTL("eCO2 (ppm)",  fmtAdaptive(f_eco2,  s_eco2, 1), 420, 150);
+}
+void drawOutdoorSet(){
+  labelValTL("Outdoor AQ",  fmtIndex(f_oaq, s_oaq), 420, 118, colorAQ(f_oaq.value()));
+  labelValTL("NO2 (ppb)",   fmtAdaptive(f_no2, s_no2, 2), 240, 186);
+  labelValTL("O3  (ppb)",   fmtAdaptive(f_o3,  s_o3,  2), 420, 186);
+}
+void drawThresholdCard(){
+  const int x=470, y=180-62, w=160, h=52;
+  panel(x,y,w,h, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(TL_DATUM); sprite.setTextSize(1); sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Thresholds", x+6, y+4); sprite.setTextColor(COL_TEXT, COL_PANEL);
+  char line[64];
+  snprintf(line, sizeof(line), "TVOC: G<=%.0f M<=%.0f", TVOC_GOOD_MAX_PPB, TVOC_MODERATE_MAX_PPB); sprite.drawString(line, x+6, y+18);
+  snprintf(line, sizeof(line), "IAQ:  G<=%.0f M<=%.0f", IAQ_GOOD_MAX, IAQ_MOD_MAX); sprite.drawString(line, x+6, y+32);
+}
+void drawVocAlert(bool alert, const String& reason, const SourceHint& hint){
+  const int x=240, y=180-62, w=220, h=52;
+  uint16_t fill = alert ? COL_BAD : COL_PANEL;
+  panel(x,y,w,h, COL_FRAME, fill, 6);
+  sprite.setTextDatum(TL_DATUM); sprite.setTextSize(1);
+  sprite.setTextColor(alert ? COL_TEXT : COL_MUTED, fill); sprite.drawString("VOC Alert", x+6, y+4);
+  sprite.setTextColor(COL_TEXT, fill);
+  sprite.drawString(alert ? reason : "No alerts", x+6, y+18);
+  sprite.setTextColor(alert ? COL_TEXT : COL_MUTED, fill);
+  String sh = String("Source: ") + hint.label; sprite.drawString(sh, x+6, y+34);
+}
+void drawStabilizationBanner(){
+  if (currentMode != MODE_INDOOR) return;
+  uint32_t elapsed = millis() - modeStartMs; if (elapsed >= IAQ_STABILIZE_MS) return;
+  uint32_t remain = (IAQ_STABILIZE_MS - elapsed + 999)/1000;
+  char msg[64]; snprintf(msg, sizeof(msg), "Stabilizing IAQ baseline… %lus", (unsigned long)remain);
+  const int x=10, y=180-22, w=220, h=16;
+  panel(x,y,w,h, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(MC_DATUM); sprite.setTextColor(COL_TEXT, COL_PANEL); sprite.setTextSize(1);
+  sprite.drawString(msg, x+w/2, y+h/2);
+}
+void drawVentilationBanner(){
+  if (!ventilationSuggest) return;
+  const int x=10, y=180-42, w=220, h=16;
+  panel(x,y,w,h, COL_FRAME, COL_WARN, 6);
+  sprite.setTextDatum(MC_DATUM); sprite.setTextColor(COL_BG, COL_WARN); sprite.setTextSize(1);
+  sprite.drawString("Consider ventilation (slow decay)", x+w/2, y+h/2);
+}
+void drawFrame(bool vocAlert, const String& vocReason, const SourceHint& hint){
+  sprite.fillSprite(COL_BG);
+  drawHeader(); drawLeftCard(); drawBigTRH(); drawIndoorSet(); drawOutdoorSet();
+  drawVocAlert(vocAlert || currentEvt.active, currentEvt.active ? (String("Active: ") + currentEvt.reason) : vocReason, hint);
+  drawThresholdCard(); drawVentilationBanner(); drawStabilizationBanner();
+  lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+}
+
+// --------------- Mode & LED logic ---------------
+void applyMode(UIMode m){
+  currentMode = m; modeStartMs = millis();
+  bool ok = (currentMode == MODE_INDOOR) ? setIndoorMode() : setOutdoorMode();
+  if (!ok) Serial.println("WARN: set mode failed (adjust API names per your library).");
+}
+void applyLedForState(bool vocAlert, float indoorIAQ, float outdoorAQ){
+  if (vocAlert){ setNiclaLed565(COL_BAD); setOrangeLed(true); return; }
+  setOrangeLed(false);
+  if (currentMode == MODE_INDOOR){
+    if (millis() - modeStartMs < IAQ_STABILIZE_MS){ setNiclaLed565(COL_CYAN); return; }
+    setNiclaLed565(colorAQ(indoorIAQ));
+  } else setNiclaLed565(colorAQ(outdoorAQ));
+}
+
+// --------------- KEY handling ---------------
+bool keyRead(){ bool level = digitalRead(PIN_KEY); return KEY_ACTIVE_LOW ? !level : level; }
+void handleKey(){
+  bool k = keyRead(); uint32_t now = millis();
+  if (k != lastKeyLevel && (now - lastKeyChangeMs) > 30){
+    lastKeyChangeMs = now; lastKeyLevel = k;
+    if (k){ longPressArmed = true; }
+    else{
+      if (longPressArmed && (now - lastKeyChangeMs) < 1500) applyMode(currentMode == MODE_INDOOR ? MODE_OUTDOOR : MODE_INDOOR);
+      longPressArmed = false;
+    }
+  }
+  if (longPressArmed && (now - lastKeyChangeMs) >= 1500){
+    longPressArmed = false;
+    bool ok = startCleaningPulse(); if (!ok) Serial.println("WARN: cleaning pulse failed.");
+  }
+}
+
+// ========================== Wi‑Fi + Cloud Sender ==========================
+
+// ---- Time helpers ----
+String iso8601_utc(time_t t){ struct tm tm; gmtime_r(&t, &tm); char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm); return String(buf); }
+time_t nowUTC(){ time_t now; time(&now); return now; }
+
+// ---- Wi‑Fi ----
+void wifiConnect(){
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Wi‑Fi connecting");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis()-t0) < 15000UL){ Serial.print("."); delay(500); }
+  Serial.println(); if (WiFi.status() == WL_CONNECTED) Serial.printf("Wi‑Fi OK, IP=%s\n", WiFi.localIP().toString().c_str());
+  else Serial.println("Wi‑Fi failed.");
+}
+void ntpSetup(){
+  configTime(TZ_GMT_OFFSET_S, TZ_DAYLIGHT_S, NTP_POOL);
+  Serial.print("Syncing NTP");
+  for (int i=0;i<20;i++){ time_t t = nowUTC(); if (t > 1700000000){ Serial.print(" OK "); Serial.println(iso8601_utc(t)); return; } Serial.print("."); delay(500); }
+  Serial.println(" NTP timeout.");
+}
+
+#if CLOUD_USE_MQTT
+WiFiClient mqttWifiClient; PubSubClient mqtt(mqttWifiClient); uint32_t mqttLastConnectTry=0;
+bool mqttConnect(){
+  if (mqtt.connected()) return true; uint32_t now=millis(); if (now - mqttLastConnectTry < 3000UL) return false;
+  mqttLastConnectTry = now; mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  Serial.print("MQTT connecting...");
+  bool ok=false; if (strlen(MQTT_USERNAME)>0) ok = mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+  else ok = mqtt.connect(MQTT_CLIENT_ID);
+  Serial.println(ok ? "OK" : "FAIL"); return ok;
+}
+#endif
+
+// ---- Event payload ----
+struct EventPayload {
+  time_t   ts_start;
+  uint32_t duration_ms;
+  float    peak_tvoc_ppb;
+  float    max_iaq_index;
+  char     source_hint[32];
+  char     reason[48];
+  char     mode[12];
+  float    tempC_end;
+  float    rh_end;
+};
+
+// ---- Event Queue ----
+struct QueueItem { bool inUse=false, sent=false; EventPayload ev; uint32_t backoffMs; uint32_t nextTryAtMs; };
+QueueItem q[MAX_EVENT_QUEUE];
+String eventToJson(const EventPayload& e){
+  String j = "{";
+  j += "\"ts_start\":\""+ iso8601_utc(e.ts_start) +"\",";
+  j += "\"duration_ms\":"+ String(e.duration_ms) +",";
+  j += "\"peak_tvoc_ppb\":"+ String(e.peak_tvoc_ppb,1) +",";
+  j += "\"max_iaq_index\":"+ String(e.max_iaq_index,1) +",";
+  j += "\"source_hint\":\""+ String(e.source_hint) +"\",";
+  j += "\"reason\":\""+ String(e.reason) +"\",";
+  j += "\"mode\":\""+ String(e.mode) +"\",";
+  j += "\"tempC_end\":"+ String(e.tempC_end,3) +",";
+  j += "\"rh_end\":"+ String(e.rh_end,2);
+  j += "}";
+  return j;
+}
+bool queuePush(const EventPayload& e){
+  for (int i=0;i<MAX_EVENT_QUEUE;i++){
+    if (!q[i].inUse){
+      q[i].inUse=true; q[i].sent=false; q[i].ev=e; q[i].backoffMs=INITIAL_BACKOFF_MS; q[i].nextTryAtMs=0; return true;
+    }
+  }
+  return false;
+}
+
+// ---- HTTP Sender ----
+bool httpSendOne(const EventPayload& e){
+#if CLOUD_USE_HTTP
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient *clientBase; WiFiClientSecure *tls=nullptr; bool useTLS=false;
+  String url = HTTP_ENDPOINT_URL; if (url.startsWith("https://")) useTLS = true;
+  if (useTLS){ tls = new WiFiClientSecure(); if (ROOT_CA_CERT && strlen(ROOT_CA_CERT) > 40) tls->setCACert(ROOT_CA_CERT); else tls->setInsecure(); clientBase = tls; }
+  else { clientBase = new WiFiClient(); }
+  HTTPClient http; if (!http.begin(*clientBase, url)){ http.end(); if (tls) delete tls; else delete clientBase; return false; }
+  http.addHeader("Content-Type", "application/json");
+  if (strlen(HTTP_API_KEY_HEADER)>0 && strlen(HTTP_API_KEY_VALUE)>0) http.addHeader(HTTP_API_KEY_HEADER, HTTP_API_KEY_VALUE);
+  String body = eventToJson(e); int code = http.POST((uint8_t*)body.c_str(), body.length()); Serial.printf("HTTP POST -> %d\n", code);
+  bool ok = (code >= 200 && code < 300); http.end(); if (tls) delete tls; else delete clientBase; return ok;
+#else
+  (void)e; return false;
+#endif
+}
+
+// ---- MQTT Sender ----
+bool mqttSendOne(const EventPayload& e){
+#if CLOUD_USE_MQTT
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!mqttConnect()) return false;
+  String payload = eventToJson(e); bool ok = mqtt.publish(MQTT_TOPIC, payload.c_str());
+  if (!ok) Serial.println("MQTT publish failed"); return ok;
+#else
+  (void)e; return false;
+#endif
+}
+
+// ---- Send loop ----
+void processQueue(){
+  uint32_t now = millis();
+  for (int i=0;i<MAX_EVENT_QUEUE;i++){
+    if (!q[i].inUse || q[i].sent) continue; if (q[i].nextTryAtMs > now) continue;
+    bool delivered=false;
+    if (CLOUD_USE_HTTP) delivered = httpSendOne(q[i].ev);
+    if (!delivered && CLOUD_USE_MQTT) delivered = mqttSendOne(q[i].ev);
+    if (delivered){ q[i].sent = true; Serial.println("Event sent ✅"); }
+    else { if (q[i].backoffMs < MAX_BACKOFF_MS) q[i].backoffMs = min(q[i].backoffMs*2, (uint32_t)MAX_BACKOFF_MS);
+           q[i].nextTryAtMs = now + q[i].backoffMs;
+           Serial.printf("Send failed, retry in %lu ms\n", (unsigned long)q[i].backoffMs);
+    }
+  }
+#if CLOUD_USE_MQTT
+  if (mqtt.connected()) mqtt.loop();
+#endif
+}
+
+// Build payload from currentEvt when ending
+EventPayload makePayload(const VocEvent& ev, float tC_end, float rh_end){
+  EventPayload e{};
+  e.ts_start     = (time_t)(ev.tStart/1000UL);
+  e.duration_ms  = (ev.tLast - ev.tStart);
+  e.peak_tvoc_ppb= ev.peakTVOC;
+  e.max_iaq_index= ev.maxIAQ;
+  strncpy(e.source_hint, ev.hint.label.c_str(), sizeof(e.source_hint)-1);
+  strncpy(e.reason, ev.reason.c_str(), sizeof(e.reason)-1);
+  strncpy(e.mode, (currentMode==MODE_INDOOR ? "Indoor" : "Outdoor"), sizeof(e.mode)-1);
+  e.tempC_end    = tC_end; e.rh_end = rh_end; return e;
+}
+
+// ============================= Setup / Loop ===============================
+void setup() {
+  Serial.begin(115200);
+
+  // Display
+  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, LOW);
+  axs15231_init(); sprite.createSprite(640, 180); sprite.setSwapBytes(1);
+  lcd_fill(0, 0, 180, 640, 0x0000); digitalWrite(TFT_BL, HIGH);
+
+  // I2C
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); Wire.setClock(400000);
+
+  // Button
+  pinMode(PIN_KEY, KEY_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+
+  // Nicla
+  if (!nicla.begin()){
+    sprite.fillSprite(COL_BG); sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(COL_BAD, COL_BG); sprite.setTextSize(2);
+    sprite.drawString("Nicla Sense Env not found (I2C)", 320, 90);
+    lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+    delay(3000);
+  }
+  applyMode(MODE_INDOOR); setNiclaLed565(COL_CYAN);
+
+  // Wi‑Fi + NTP
+  if (CLOUD_USE_HTTP || CLOUD_USE_MQTT){ wifiConnect(); ntpSetup(); }
+#if CLOUD_USE_MQTT
+  mqtt.setBufferSize(2048);
+#endif
+}
+
+void loop() {
+  handleKey();
+
+  uint32_t nowMs = millis();
+
+  // Read sensors (per official features)
+  float tC      = nicla.readTemperature();
+  float rh      = nicla.readHumidity();
+
+  float tvoc    = nicla.readTVOC();
+  float eco2    = nicla.readECO2();
+  float iaq     = nicla.readIndoorAirQuality();
+
+  float no2     = nicla.readNO2();
+  float o3      = nicla.readO3();
+  float oaq     = nicla.readOutdoorAirQuality();
+
+  // Stats + EMA
+  s_tC.push(tC); s_rh.push(rh); s_tvoc.push(tvoc); s_eco2.push(eco2); s_iaq.push(iaq);
+  s_no2.push(no2); s_o3.push(o3); s_oaq.push(oaq);
+
+  f_tC.update(tC); f_rh.update(rh); f_tvoc.update(tvoc); f_eco2.update(eco2);
+  f_iaq.update(iaq); f_no2.update(no2); f_o3.update(o3); f_oaq.update(oaq);
+
+  // VOC Alert (TVOC‑only)
+  bool vocAlert=false; String vocReason;
+  if (!isnan(tvoc) && tvoc > VOC_ALERT_TVOC_PPB){
+    vocAlert=true; vocReason = "TVOC " + String(tvoc,1) + " ppb";
+  }
+
+  // Source hint
+  uint32_t alertElapsed = currentEvt.active ? (nowMs - currentEvt.tStart) : 0;
+  SourceHint hint = classifySource(nowMs, tvoc, iaq, tC, rh, vocAlert || currentEvt.active, alertElapsed);
+
+  // Event lifecycle
+  static uint32_t belowResetSince=0;
+  const float RESET_TVOC = 0.6f * VOC_ALERT_TVOC_PPB;
+
+  if (vocAlert && !currentEvt.active){
+    currentEvt.active = true; currentEvt.tStart = nowMs; currentEvt.tLast = nowMs;
+    currentEvt.peakTVOC = tvoc; currentEvt.maxIAQ = iaq; currentEvt.hint = hint; currentEvt.reason = vocReason;
+    decay.havePeak=false; ventilationSuggest=false;
+  } else if (vocAlert && currentEvt.active){
+    currentEvt.tLast = nowMs;
+    if (!isnan(tvoc) && (isnan(currentEvt.peakTVOC) || tvoc > currentEvt.peakTVOC)) currentEvt.peakTVOC = tvoc;
+    if (!isnan(iaq)  && (isnan(currentEvt.maxIAQ)  || iaq  > currentEvt.maxIAQ))   currentEvt.maxIAQ  = iaq;
+    if (hint.cls != SRC_UNKNOWN) currentEvt.hint = hint;
+    currentEvt.reason = vocReason;
+  } else if (!vocAlert && currentEvt.active){
+    if (!isnan(tvoc) && tvoc < RESET_TVOC){
+      if (belowResetSince==0) belowResetSince = nowMs;
+      if (nowMs - belowResetSince > 10000UL){
+        // finalize event -> queue payload
+        EventPayload p = makePayload(currentEvt, tC, rh);
+        if (!queuePush(p)) Serial.println("Queue full; event not queued.");
+        currentEvt.active = false; belowResetSince = 0;
+      }
+    } else belowResetSince = 0;
+  }
+
+  // LED + decay + UI
+  applyLedForState(vocAlert, iaq, oaq);
+  updateDecay(nowMs, tvoc, vocAlert || currentEvt.active);
+  drawFrame(vocAlert || currentEvt.active, vocReason, hint);
+
+  // Slope memory
+  lastRaw.have=true; lastRaw.t=nowMs; lastRaw.tvoc=tvoc; lastRaw.iaq=iaq; lastRaw.tC=tC; lastRaw.rh=rh;
+
+  // Cloud sender
+  if ((CLOUD_USE_HTTP || CLOUD_USE_MQTT) && (WiFi.status() != WL_CONNECTED)) wifiConnect();
+  if (CLOUD_USE_HTTP || CLOUD_USE_MQTT) processQueue();
+
+  delay(SAMPLE_MS);
+}
