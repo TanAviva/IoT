@@ -1,0 +1,713 @@
+/*
+ * Nicla Sense Env → T‑Display S3 Long (ESP32‑S3 + AXS15231B, 180×640)
+ * Precision‑Max + Source‑Aware build
+ *
+ * Adds:
+ *  - Source Hints (heuristics): Cooking heat/oils, Spray/Perfume/Solvent, Cleaning/Air freshener, Human activity/occupancy
+ *  - Event logger for VOC Alerts (start, duration, peak TVOC, peak Ethanol idx, max IAQ, source hint)
+ *  - Ventilation reminder banner based on slow TVOC decay rate
+ * Keeps:
+ *  - Precision formatting (EMA + 10‑sample rolling σ → adaptive decimals)
+ *  - VOC Alert (TVOC > 1000 ppb or Ethanol idx > 0.50) + LED mirroring (red), thresholds card
+ *  - Indoor/Outdoor mode selection (KEY short‑press), Cleaning (KEY long‑press), IAQ warm‑up banner (~15 min)
+ *
+ * Why these heuristics?
+ *  - Cooking plumes: VOCs (alcohols, aldehydes, ketones, furans) scale with temperature/method; pan‑fry/deep‑fry >> boil/air‑fry. [Indoor studies]  (Tang et al., 2024; Atamaleki et al., 2022)
+ *  - Fragrance & personal care: hundreds of VOCs incl. monoterpenes/alcohols; ozone triggers rapid new particle formation. (Wu et al., 2024; NOAA 2018)
+ *  - Cleaning & air fresheners: terpenes/glycol ethers; with ozone form secondary pollutants (e.g., formaldehyde). (CARB fact sheet; LBNL Singer et al.)
+ *  - Human presence: breath/skin VOCs rise with heat/humidity/skin exposure; ammonia also increases with temperature. (Wang et al., 2022; Li et al., 2020)
+ *
+ * Refs:
+ *  Tang 2024 (Indoor Air) DOI:10.1155/2024/6355613; Atamaleki 2022 (Air Qual Atmos Health)    [cooking]
+ *  Wu 2024 (ES&T Letters) CC‑BY; NOAA Science 2018                                          [perfume/PCPs]
+ *  CARB Cleaning Products Fact Sheet; Singer et al., LBNL-58250 (Indoor Air)                 [cleaning/terpenes]
+ *  Wang 2022 (Environ Sci Technol); Li 2020 (EST)                                            [human emissions]
+ *
+ * If your Nicla library uses different names (setIndoorAirQualityMode, setRgbLed, etc.),
+ * open File → Examples → Arduino_NiclaSenseEnv and adjust calls marked "adjust if needed".
+ */
+
+// -------------------- Includes --------------------
+#include "AXS15231B.h"             // LilyGO AXS driver (from T-Display-S3-Long repo /lib)
+#include <Arduino.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <Arduino_NiclaSenseEnv.h> // Official Arduino library for Nicla Sense Env
+
+// -------------------- I2C Pins --------------------
+// A) Common on many T‑Display S3 Long builds:
+#define I2C_SDA_PIN 15
+#define I2C_SCL_PIN 10
+// B) If you use the board's Qwiic header on some revisions:
+// #define I2C_SDA_PIN 43
+// #define I2C_SCL_PIN 44
+
+// -------------------- Buttons ---------------------
+// KEY on many S3 Long variants (change if your board differs)
+#define PIN_KEY  14
+#define KEY_ACTIVE_LOW  1
+
+// -------------------- Display / Objects -----------
+TFT_eSPI tft(180, 640);
+TFT_eSprite sprite(&tft);
+NiclaSenseEnv nicla(Wire);
+
+// -------------------- Theme -----------------------
+#define COL_BG     0x0000
+#define COL_PANEL  0x0842
+#define COL_FRAME  0x3186
+#define COL_TEXT   0xFFFF
+#define COL_MUTED  0xAD55
+#define COL_ACCENT 0xFDA0
+#define COL_CYAN   0x07FF
+#define COL_WARN   0xFFE0
+#define COL_GOOD   0x07E0
+#define COL_BAD    0xF800
+#define COL_BARBG  0x0841
+#define COL_RED    0xF800
+
+// -------------------- Modes -----------------------
+enum UIMode : uint8_t { MODE_INDOOR = 0, MODE_OUTDOOR = 1 };
+UIMode currentMode = MODE_INDOOR;
+
+// IAQ warm-up (ZMOD4410 baseline stabilization) ~15 min
+const uint32_t IAQ_STABILIZE_MS = 15UL * 60UL * 1000UL;
+uint32_t modeStartMs = 0;
+
+// -------------------- Sampling cadence ------------
+const uint32_t SAMPLE_MS = 1000;
+
+// -------------------- VOC thresholds (CONFIG) -----
+// TVOC category bands (ppb) — tune for your space
+static const float TVOC_GOOD_MAX_PPB     = 300.0f;    // Good:    0..300
+static const float TVOC_MODERATE_MAX_PPB = 1000.0f;   // Moderate: 300..1000
+static const float VOC_ALERT_TVOC_PPB    = 1000.0f;   // Alert if TVOC > 1000 ppb
+static const float VOC_ALERT_ETHANOL     = 0.50f;     // Alert if Ethanol index > 0.50
+
+// IAQ bands (index)
+static const float IAQ_GOOD_MAX = 50.0f;              // Good:     ≤ 50
+static const float IAQ_MOD_MAX  = 100.0f;             // Moderate:  51..100
+
+// -------------------- Button handling -------------
+uint32_t lastKeyChangeMs = 0;
+bool lastKeyLevel = true;
+bool longPressArmed = false;
+
+// -------------------- Stats & Filters -------------
+// Rolling window stats (size N=10) for adaptive precision
+template<size_t N>
+struct RollingWindowStats {
+  float buf[N];
+  size_t count = 0;
+  size_t head = 0;
+  double sum = 0.0, sumsq = 0.0;
+
+  void reset(){ count=0; head=0; sum=0.0; sumsq=0.0; }
+  void push(float v){
+    if (isnan(v)) return; // ignore NaN samples for stats
+    if (count < N){
+      buf[head++] = v; if (head>=N) head=0;
+      sum += v; sumsq += (double)v*v;
+      count++;
+    } else {
+      float old = buf[head];
+      buf[head] = v;
+      head = (head+1)%N;
+      sum += v - old;
+      sumsq += (double)v*v - (double)old*old;
+    }
+  }
+  float mean() const { return (count>0) ? (float)(sum/(double)count) : NAN; }
+  float stddev() const {
+    if (count==0) return NAN;
+    double m = sum/(double)count;
+    double var = (sumsq/(double)count) - m*m;
+    if (var<0) var=0;
+    return (float)sqrt(var);
+  }
+};
+
+// EMA filter for display smoothing
+struct EmaFilter {
+  float alpha;
+  bool have=false;
+  float val=0;
+  EmaFilter(float a=0.3f):alpha(a){}
+  void reset(){ have=false; val=0; }
+  void update(float x){
+    if (isnan(x)) return;
+    if (!have){ val=x; have=true; }
+    else       { val = alpha*x + (1.0f-alpha)*val; }
+  }
+  float value() const { return have ? val : NAN; }
+};
+
+// Instantiate per metric
+RollingWindowStats<10> s_tC, s_rh, s_tvoc, s_eco2, s_iaq, s_odor, s_eth, s_no2, s_o3, s_oaq;
+EmaFilter f_tC(0.25f), f_rh(0.25f), f_tvoc(0.35f), f_eco2(0.35f),
+          f_iaq(0.35f), f_odor(0.35f), f_eth(0.35f), f_no2(0.35f), f_o3(0.35f), f_oaq(0.35f);
+
+// Keep last raw sample to compute slopes (for Source Hints and decay)
+struct LastRaw {
+  bool have=false;
+  uint32_t t=0;
+  float tvoc= NAN, ethanol=NAN, iaq=NAN, tC=NAN, rh=NAN;
+} lastRaw;
+
+// Adaptive decimals chooser
+int chooseDecimals(float mean, float sigma, int maxDp){
+  if (isnan(mean) || isnan(sigma) || maxDp<=0) return 0;
+  float absMean = fabsf(mean);
+  float rsd = (absMean > 1e-9f) ? (sigma/absMean) : sigma; // small means → use absolute σ
+  if (absMean <= 1e-6f)         return min(3, maxDp);  // near zero & stable
+  if (rsd < 0.002f)             return min(3, maxDp);  // <0.2% → max
+  if (rsd < 0.010f)             return min(2, maxDp);  // <1%   → 2
+  if (rsd < 0.050f)             return min(1, maxDp);  // <5%   → 1
+  return 0;
+}
+
+// Formatters (EMA + adaptive decimals)
+String fmtAdaptive(const EmaFilter& ema, const RollingWindowStats<10>& stats, int maxDp){
+  float v = ema.value();
+  if (isnan(v)) return String("--");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), maxDp);
+  return String(v, dp);
+}
+String fmtT(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--.--");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), 3); dp = max(dp, 1);
+  return String(v, dp);
+}
+String fmtRH(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--.-");
+  int dp = chooseDecimals(stats.mean(), stats.stddev(), 2); dp = max(dp, 1);
+  return String(v, dp);
+}
+String fmtIndex(const EmaFilter& ema, const RollingWindowStats<10>& stats){
+  float v = ema.value(); if (isnan(v)) return String("--");
+  int dp = min(1, chooseDecimals(stats.mean(), stats.stddev(), 1));
+  return String(v, dp);
+}
+
+// -------------------- Source Hint Heuristics --------------------
+enum SourceClass : uint8_t {
+  SRC_UNKNOWN=0, SRC_COOKING, SRC_SPRAY, SRC_CLEANING, SRC_OCCUPANCY
+};
+struct SourceHint {
+  SourceClass cls=SRC_UNKNOWN;
+  String label="—";
+};
+
+// Heuristic thresholds (tunable)
+const float SLOPE_SPRAY_FAST_PPBs   = 150.0f;   // dTVOC/dt threshold for spray burst
+const float ETH_SPRAY_MIN           = 0.30f;    // ethanol idx for sprays/solvents
+const float COOK_T_RISE_MIN_C       = 0.20f;    // temperature rise over ~2 min
+const float COOK_RH_RISE_MIN        = 2.0f;     // humidity rise over ~2 min
+const float OCCUPANCY_RH_DRIFT_MIN  = 0.8f;     // slow RH drift suggesting occupancy
+const float CLEAN_DUR_MIN_MS        = 5UL*60UL*1000UL; // sustained spikes ~cleaning session
+const float SPRAY_DUR_MAX_MS        = 120UL*1000UL;    // brief spray bursts
+
+// Memory for 2‑minute deltas (for cooking/occupancy)
+struct Drift2Min {
+  bool have=false;
+  uint32_t t0=0;
+  float tC0=NAN, rh0=NAN, tvoc0=NAN;
+} drift2m;
+
+// Classify likely source based on slopes, ethanol, and T/RH drifts
+SourceHint classifySource(uint32_t nowMs, float tvoc, float ethanol, float iaq, float tC, float rh, bool vocAlertActive, uint32_t alertElapsedMs){
+  SourceHint h;
+
+  // Compute instantaneous slope dTVOC/dt (ppb/s)
+  float dTVOC = NAN, dETH = NAN;
+  if (lastRaw.have){
+    float dt = (nowMs - lastRaw.t)/1000.0f;
+    if (dt > 0.1f){
+      dTVOC = (!isnan(tvoc) && !isnan(lastRaw.tvoc)) ? (tvoc - lastRaw.tvoc)/dt : NAN;
+      dETH  = (!isnan(ethanol) && !isnan(lastRaw.ethanol)) ? (ethanol - lastRaw.ethanol)/dt : NAN;
+    }
+  }
+
+  // Maintain 2‑minute drift anchors
+  if (!drift2m.have || nowMs - drift2m.t0 > 120000UL){
+    drift2m.have = true; drift2m.t0 = nowMs; drift2m.tC0 = tC; drift2m.rh0 = rh; drift2m.tvoc0 = tvoc;
+  }
+  float dT2m  = (!isnan(tC)  && !isnan(drift2m.tC0)) ? (tC  - drift2m.tC0)  : NAN;
+  float dRH2m = (!isnan(rh)  && !isnan(drift2m.rh0)) ? (rh  - drift2m.rh0)  : NAN;
+  float dV2m  = (!isnan(tvoc)&& !isnan(drift2m.tvoc0))? (tvoc- drift2m.tvoc0) : NAN;
+
+  // 1) Spray/Perfume/Solvent: very fast TVOC ramp + notable ethanol, short duration
+  if (!isnan(dTVOC) && dTVOC > SLOPE_SPRAY_FAST_PPBs && ethanol >= ETH_SPRAY_MIN && alertElapsedMs <= SPRAY_DUR_MAX_MS){
+    h.cls = SRC_SPRAY; h.label = "Spray/Perfume/Solvent";
+    return h;
+  }
+
+  // 2) Cooking heat/oils: TVOC high + T or RH rising over minutes; ethanol may or may not be high
+  bool cookRise = (!isnan(dT2m) && dT2m >= COOK_T_RISE_MIN_C) || (!isnan(dRH2m) && dRH2m >= COOK_RH_RISE_MIN);
+  if (vocAlertActive && cookRise && tvoc >= TVOC_GOOD_MAX_PPB){
+    h.cls = SRC_COOKING; h.label = "Cooking heat/oils";
+    return h;
+  }
+
+  // 3) Cleaning/Air freshener: sustained elevated TVOC (multi‑minute), often with intermittent bursts; ethanol variable
+  if (vocAlertActive && alertElapsedMs >= CLEAN_DUR_MIN_MS){
+    h.cls = SRC_CLEANING; h.label = "Cleaning / Air freshener";
+    return h;
+  }
+
+  // 4) Human activity/occupancy: slow TVOC drift + RH creep, ethanol low
+  if ((!isnan(dRH2m) && dRH2m >= OCCUPANCY_RH_DRIFT_MIN) && ethanol < ETH_SPRAY_MIN && (!isnan(dV2m) && dV2m > 0)){
+    h.cls = SRC_OCCUPANCY; h.label = "Human activity / occupancy";
+    return h;
+  }
+
+  // Fallback
+  h.cls = SRC_UNKNOWN; h.label = "—";
+  return h;
+}
+
+// -------------------- VOC Event Logger --------------------
+struct VocEvent {
+  bool active=false;
+  uint32_t tStart=0;
+  uint32_t tLast=0;
+  float peakTVOC=NAN;
+  float peakEth=NAN;
+  float maxIAQ=NAN;
+  SourceHint hint;
+};
+
+VocEvent currentEvt;
+struct PastEvent {
+  uint32_t dtMs=0;
+  float peakTVOC, peakEth, maxIAQ;
+  String hint;
+};
+const int MAX_PAST = 5;
+PastEvent past[MAX_PAST];
+int pastHead = 0;
+
+void startEvent(uint32_t now, float tvoc, float eth, float iaq, const SourceHint& hint){
+  currentEvt.active = true;
+  currentEvt.tStart = now;
+  currentEvt.tLast  = now;
+  currentEvt.peakTVOC = tvoc;
+  currentEvt.peakEth  = eth;
+  currentEvt.maxIAQ   = iaq;
+  currentEvt.hint     = hint;
+}
+void updateEvent(uint32_t now, float tvoc, float eth, float iaq, const SourceHint& hint){
+  currentEvt.tLast = now;
+  if (!isnan(tvoc) && (isnan(currentEvt.peakTVOC) || tvoc > currentEvt.peakTVOC)) currentEvt.peakTVOC = tvoc;
+  if (!isnan(eth)  && (isnan(currentEvt.peakEth)  || eth  > currentEvt.peakEth))  currentEvt.peakEth  = eth;
+  if (!isnan(iaq)  && (isnan(currentEvt.maxIAQ)   || iaq  > currentEvt.maxIAQ))   currentEvt.maxIAQ   = iaq;
+  // Update hint if we get a stronger classification (non‑unknown takes precedence)
+  if (hint.cls != SRC_UNKNOWN) currentEvt.hint = hint;
+}
+void endEvent(){
+  if (!currentEvt.active) return;
+  PastEvent e;
+  e.dtMs     = currentEvt.tLast - currentEvt.tStart;
+  e.peakTVOC = currentEvt.peakTVOC;
+  e.peakEth  = currentEvt.peakEth;
+  e.maxIAQ   = currentEvt.maxIAQ;
+  e.hint     = currentEvt.hint.label;
+  past[pastHead] = e;
+  pastHead = (pastHead+1) % MAX_PAST;
+  currentEvt.active = false;
+}
+
+// -------------------- Ventilation Reminder --------------------
+// Track decay after a peak; if percent drop/min < threshold → remind
+struct DecayTracker {
+  bool havePeak=false;
+  float peakVal=NAN;
+  uint32_t tPeak=0;
+  // compute percent drop per minute based on last 60s window
+  float lastVal=NAN;
+  uint32_t lastT=0;
+} decay;
+
+const float DECAY_MIN_DROP_PER_MIN = 20.0f; // require ≥20%/min drop; else suggest ventilation
+bool ventilationSuggest=false;
+uint32_t ventilationLastTrigger=0;
+const uint32_t VENT_BANNER_HOLD_MS = 90UL*1000UL;
+
+void updateDecay(uint32_t nowMs, float tvoc, bool vocAlertActive){
+  if (isnan(tvoc)) return;
+
+  // Track peak during or right after alert
+  if (vocAlertActive){
+    if (!decay.havePeak || tvoc > decay.peakVal){
+      decay.havePeak=true; decay.peakVal=tvoc; decay.tPeak=nowMs;
+    }
+  }
+
+  // Every ~60s, compute percent drop from peak to current
+  if (decay.havePeak){
+    if (decay.lastT==0 || nowMs - decay.lastT >= 60000UL){
+      decay.lastT   = nowMs;
+      decay.lastVal = tvoc;
+
+      float dtMin   = (nowMs - decay.tPeak) / 60000.0f;
+      if (dtMin > 0.0f && decay.peakVal > 0.0f){
+        float dropPct = 100.0f * (decay.peakVal - tvoc) / decay.peakVal;
+        float dropPerMin = dropPct / dtMin;
+        // If we are well past peak and decay is too slow, suggest ventilation
+        if ((nowMs - decay.tPeak) > 120000UL && dropPerMin < DECAY_MIN_DROP_PER_MIN){
+          ventilationSuggest = true;
+          ventilationLastTrigger = nowMs;
+        }
+        // Reset suggestion after banner hold
+        if (ventilationSuggest && (nowMs - ventilationLastTrigger) > VENT_BANNER_HOLD_MS){
+          ventilationSuggest = false;
+        }
+        // Reset peak if we decayed well (e.g., >70% drop)
+        if (dropPct >= 70.0f){
+          decay.havePeak=false;
+        }
+      }
+    }
+  } else {
+    ventilationSuggest = false;
+  }
+}
+
+// ---------------- UI helpers ---------------------
+void panel(int x,int y,int w,int h,uint16_t outline,uint16_t fill,int r=6){
+  sprite.fillRoundRect(x,y,w,h,r,fill);
+  sprite.drawRoundRect(x,y,w,h,r,outline);
+}
+void labelValTL(const char* label, const String& val, int x, int y, uint16_t col=COL_TEXT){
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString(label, x, y);
+  sprite.setTextSize(2);
+  sprite.setTextColor(col, COL_BG);
+  sprite.drawString(val, x, y+14);
+}
+uint16_t colorAQ(float idx){
+  if (isnan(idx)) return COL_MUTED;
+  if (idx <= IAQ_GOOD_MAX)     return COL_GOOD;
+  if (idx <= IAQ_MOD_MAX)      return COL_WARN;
+  return COL_BAD;
+}
+
+// ---------------- Nicla helpers ------------------
+// Adjust names per your library examples if needed.
+bool setIndoorMode(){ return nicla.setIndoorAirQualityMode(); }
+bool setOutdoorMode(){ return nicla.setOutdoorAirQualityMode(); }
+bool startCleaningPulse(){ return nicla.startCleaning(); }
+void setNiclaLedRgb(uint8_t r, uint8_t g, uint8_t b){ nicla.setRgbLed(r,g,b); }
+void setNiclaLed565(uint16_t c){
+  uint8_t r = ((c >> 11) & 0x1F) * 255 / 31;
+  uint8_t g = ((c >>  5) & 0x3F) * 255 / 63;
+  uint8_t b = ((c >>  0) & 0x1F) * 255 / 31;
+  setNiclaLedRgb(r,g,b);
+}
+void setOrangeLed(bool on){
+  // If not available in your lib, comment out next line
+  nicla.setOrangeLed(on);
+}
+
+// ---------------- UI sections ---------------------
+void drawHeader(){
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_BG);
+  sprite.setTextSize(2);
+  sprite.drawString("Nicla Sense Env — T‑Display S3 Long (Precision‑Max + Source)", 10, 6);
+
+  // Mode badge (top-right)
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_BG);
+  sprite.drawString("Mode:", 630, 8);
+  sprite.setTextColor(COL_ACCENT, COL_BG);
+  sprite.drawString(currentMode == MODE_INDOOR ? "Indoor IAQ" : "Outdoor AQ", 630, 24);
+}
+
+void drawLeftCard(){
+  panel(10, 34, 220, 140, COL_FRAME, COL_PANEL, 8);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Sensors / Links", 20, 42);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.drawString("HS4001: Temp / Humidity", 20, 58);
+  sprite.drawString("ZMOD4410: TVOC, eCO2, IAQ", 20, 74);
+  sprite.drawString("ZMOD4510: NO2, O3, OAQ",    20, 90);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("I2C (ESLOV) @ 3.3V", 20, 108);
+  sprite.drawString("Arduino_NiclaSenseEnv", 20, 124);
+}
+
+void drawBigTRH(){
+  panel(240, 40, 390, 70, COL_FRAME, 0x0010, 8);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_CYAN, 0x0010);
+  sprite.setTextSize(4);
+  String sT = fmtT(f_tC, s_tC);
+  String sH = fmtRH(f_rh, s_rh);
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%s °C  |  %s %%RH", sT.c_str(), sH.c_str());
+  sprite.drawString(buf, 240+195, 40+35);
+}
+
+void drawIndoorSet(){
+  labelValTL("Indoor IAQ",  fmtIndex(f_iaq, s_iaq), 240, 118, colorAQ(f_iaq.value()));
+  labelValTL("TVOC (ppb)",  fmtAdaptive(f_tvoc,  s_tvoc, 2), 240, 150);
+  labelValTL("eCO2 (ppm)",  fmtAdaptive(f_eco2,  s_eco2, 1), 420, 150);
+  labelValTL("Odor idx",    fmtAdaptive(f_odor,  s_odor, 3), 240, 186);
+  labelValTL("Ethanol idx", fmtAdaptive(f_eth,   s_eth,  3), 420, 186);
+}
+
+void drawOutdoorSet(){
+  labelValTL("Outdoor AQ",  fmtIndex(f_oaq, s_oaq), 420, 118, colorAQ(f_oaq.value()));
+  labelValTL("NO2 (ppb)",   fmtAdaptive(f_no2, s_no2, 2), 240, 222);
+  labelValTL("O3  (ppb)",   fmtAdaptive(f_o3,  s_o3,  2), 420, 222);
+}
+
+void drawThresholdCard(){
+  const int x=470, y=180-62, w=160, h=52;
+  panel(x,y,w,h, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(COL_MUTED, COL_PANEL);
+  sprite.drawString("Thresholds", x+6, y+4);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  char line[64];
+  snprintf(line, sizeof(line), "TVOC: G<=%.0f M<=%.0f", TVOC_GOOD_MAX_PPB, TVOC_MODERATE_MAX_PPB);
+  sprite.drawString(line, x+6, y+18);
+  snprintf(line, sizeof(line), "IAQ:  G<=%.0f M<=%.0f", IAQ_GOOD_MAX, IAQ_MOD_MAX);
+  sprite.drawString(line, x+6, y+32);
+}
+
+void drawVocAlert(bool alert, const String& reason, const SourceHint& hint){
+  const int x=240, y=180-62, w=220, h=52;
+  uint16_t fill = alert ? COL_BAD : COL_PANEL;
+  panel(x,y,w,h, COL_FRAME, fill, 6);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(alert ? COL_TEXT : COL_MUTED, fill);
+  sprite.drawString("VOC Alert", x+6, y+4);
+  sprite.setTextColor(COL_TEXT, fill);
+  sprite.drawString(alert ? reason : "No alerts", x+6, y+18);
+
+  // Source hint line
+  sprite.setTextColor(alert ? COL_TEXT : COL_MUTED, fill);
+  String sh = String("Source: ") + hint.label;
+  sprite.drawString(sh, x+6, y+34);
+}
+
+void drawStabilizationBanner(){
+  if (currentMode != MODE_INDOOR) return;
+  uint32_t elapsed = millis() - modeStartMs;
+  if (elapsed >= IAQ_STABILIZE_MS) return;
+  uint32_t remain = (IAQ_STABILIZE_MS - elapsed + 999)/1000;
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Stabilizing IAQ baseline… %lus", (unsigned long)remain);
+
+  const int x=10, y=180-22, w=220, h=16;
+  panel(x,y,w,h, COL_FRAME, COL_PANEL, 6);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_TEXT, COL_PANEL);
+  sprite.setTextSize(1);
+  sprite.drawString(msg, x+w/2, y+h/2);
+}
+
+void drawVentilationBanner(){
+  if (!ventilationSuggest) return;
+  const int x=10, y=180-42, w=220, h=16;
+  panel(x,y,w,h, COL_FRAME, COL_WARN, 6);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(COL_BG, COL_WARN);
+  sprite.setTextSize(1);
+  sprite.drawString("Consider ventilation (slow decay)", x+w/2, y+h/2);
+}
+
+void drawFrame(bool vocAlert, const String& vocReason, const SourceHint& hint){
+  sprite.fillSprite(COL_BG);
+  drawHeader();
+  drawLeftCard();
+  drawBigTRH();
+  drawIndoorSet();
+  drawOutdoorSet();
+  drawVocAlert(vocAlert, vocReason, hint);
+  drawThresholdCard();
+  drawVentilationBanner();
+  drawStabilizationBanner();
+  lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+}
+
+// --------------- Mode & LED logic ---------------
+void applyMode(UIMode m){
+  currentMode = m;
+  modeStartMs = millis();
+  bool ok = (currentMode == MODE_INDOOR) ? setIndoorMode() : setOutdoorMode();
+  if (!ok) Serial.println("WARN: set mode failed (adjust API names per your library).");
+}
+
+void applyLedForState(bool vocAlert, float indoorIAQ, float outdoorAQ){
+  if (vocAlert){
+    setNiclaLed565(COL_BAD);     // Red for alert
+    setOrangeLed(true);          // Auxiliary alert
+    return;
+  }
+  setOrangeLed(false);
+  if (currentMode == MODE_INDOOR){
+    if (millis() - modeStartMs < IAQ_STABILIZE_MS){
+      setNiclaLed565(COL_CYAN);
+      return;
+    }
+    setNiclaLed565(colorAQ(indoorIAQ));
+  } else {
+    setNiclaLed565(colorAQ(outdoorAQ));
+  }
+}
+
+// --------------- KEY handling ---------------
+bool keyRead(){
+  bool level = digitalRead(PIN_KEY);
+  return KEY_ACTIVE_LOW ? !level : level;
+}
+void handleKey(){
+  bool k = keyRead();
+  uint32_t now = millis();
+
+  if (k != lastKeyLevel && (now - lastKeyChangeMs) > 30){
+    lastKeyChangeMs = now;
+    lastKeyLevel = k;
+
+    if (k){ longPressArmed = true; }
+    else{
+      if (longPressArmed && (now - lastKeyChangeMs) < 1500){
+        applyMode(currentMode == MODE_INDOOR ? MODE_OUTDOOR : MODE_INDOOR);
+      }
+      longPressArmed = false;
+    }
+  }
+
+  if (longPressArmed && (now - lastKeyChangeMs) >= 1500){
+    longPressArmed = false;
+    bool ok = startCleaningPulse();
+    if (!ok) Serial.println("WARN: cleaning pulse failed (adjust per lib examples).");
+  }
+}
+
+// --------------- Setup -----------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Display init
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);
+  axs15231_init();
+  sprite.createSprite(640, 180);
+  sprite.setSwapBytes(1);
+  lcd_fill(0, 0, 180, 640, 0x0000);
+  digitalWrite(TFT_BL, HIGH);
+
+  // I2C init
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  // KEY button
+  pinMode(PIN_KEY, KEY_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+
+  // Nicla begin
+  if (!nicla.begin()){
+    sprite.fillSprite(COL_BG);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(COL_BAD, COL_BG);
+    sprite.setTextSize(2);
+    sprite.drawString("Nicla Sense Env not found (I2C)", 320, 90);
+    lcd_PushColors_rotated_90(0, 0, 640, 180, (uint16_t*)sprite.getPointer());
+    delay(3000);
+  }
+
+  // Start in Indoor mode
+  applyMode(MODE_INDOOR);
+  setNiclaLed565(COL_CYAN); // active/stabilizing
+}
+
+// --------------- Loop ------------------------
+void loop() {
+  handleKey();
+
+  uint32_t nowMs = millis();
+
+  // ---- Read current metrics ----
+  float tC      = nicla.readTemperature();
+  float rh      = nicla.readHumidity();
+
+  float tvoc    = nicla.readTVOC();
+  float eco2    = nicla.readECO2();
+  float iaq     = nicla.readIndoorAirQuality();
+  float odor    = nicla.readOdorIndex();
+  float ethanol = nicla.readEthanolIndex();
+
+  float no2     = nicla.readNO2();
+  float o3      = nicla.readO3();
+  float oaq     = nicla.readOutdoorAirQuality();
+
+  // ---- Push into stats ----
+  s_tC.push(tC); s_rh.push(rh); s_tvoc.push(tvoc); s_eco2.push(eco2); s_iaq.push(iaq);
+  s_odor.push(odor); s_eth.push(ethanol); s_no2.push(no2); s_o3.push(o3); s_oaq.push(oaq);
+
+  // ---- EMA for display ----
+  f_tC.update(tC); f_rh.update(rh); f_tvoc.update(tvoc); f_eco2.update(eco2); f_iaq.update(iaq);
+  f_odor.update(odor); f_eth.update(ethanol); f_no2.update(no2); f_o3.update(o3); f_oaq.update(oaq);
+
+  // ---- VOC Alert logic (unchanged thresholds) ----
+  bool vocAlert = false; String vocReason;
+  if (!isnan(tvoc) && tvoc > VOC_ALERT_TVOC_PPB){
+    vocAlert = true; vocReason = "TVOC " + String(tvoc,1) + " ppb";
+  } else if (!isnan(ethanol) && ethanol > VOC_ALERT_ETHANOL){
+    vocAlert = true; vocReason = "Ethanol idx " + String(ethanol,2);
+  }
+
+  // ---- Source hint (uses slopes & drifts) ----
+  uint32_t alertElapsed = 0;
+  if (currentEvt.active) alertElapsed = nowMs - currentEvt.tStart;
+  SourceHint hint = classifySource(nowMs, tvoc, ethanol, iaq, tC, rh, vocAlert || currentEvt.active, currentEvt.active ? alertElapsed : 0);
+
+  // ---- Event start/update/end rules ----
+  static uint32_t belowResetSince = 0;
+  const float RESET_TVOC = 0.6f * VOC_ALERT_TVOC_PPB; // end event when below 60% of threshold for several seconds
+
+  if (vocAlert && !currentEvt.active){
+    startEvent(nowMs, tvoc, ethanol, iaq, hint);
+    // Prepare decay tracking
+    decay.havePeak=false; ventilationSuggest=false;
+  } else if (vocAlert && currentEvt.active){
+    updateEvent(nowMs, tvoc, ethanol, iaq, hint);
+  } else if (!vocAlert && currentEvt.active){
+    // Check if we've been low enough for > 10s to close the event
+    if (!isnan(tvoc) && tvoc < RESET_TVOC){
+      if (belowResetSince==0) belowResetSince = nowMs;
+      if (nowMs - belowResetSince > 10000UL){
+        endEvent();
+        belowResetSince = 0;
+      }
+    } else {
+      belowResetSince = 0;
+    }
+  }
+
+  // ---- LED state ----
+  applyLedForState(vocAlert, iaq, oaq);
+
+  // ---- Decay tracker for ventilation hint ----
+  updateDecay(nowMs, tvoc, vocAlert || currentEvt.active);
+
+  // ---- Draw ----
+  drawFrame(vocAlert || currentEvt.active,
+            currentEvt.active ? (String("Active: ") + vocReason) : vocReason,
+            hint);
+
+  // ---- Update last raw (for slope) ----
+  lastRaw.have = true; lastRaw.t = nowMs; lastRaw.tvoc = tvoc; lastRaw.ethanol = ethanol; lastRaw.iaq = iaq; lastRaw.tC = tC; lastRaw.rh = rh;
+
+  delay(SAMPLE_MS);
+}
