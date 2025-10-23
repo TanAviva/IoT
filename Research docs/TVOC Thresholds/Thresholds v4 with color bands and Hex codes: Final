@@ -1,0 +1,56 @@
+Absolutely! Here's the updated version of the ultra-granular TVOC and ethanol index tables with corresponding hex colour codes for each level. These hex codes are commonly used in dashboards, sensor interfaces, and environmental visualisations.
+
+---
+
+### 🧪 Ultra-Granular TVOC Thresholds with Colour Coding and Hex Values
+
+| **Level** | **TVOC Range (ppb)** | **Approx. µg/m³** | **Air Quality Description**                                                                 | **Colour Name**     | **Hex Code** |
+|-----------|----------------------|-------------------|---------------------------------------------------------------------------------------------|----------------------|--------------|
+| A1        | 0 – 25               | 0 – ~0.12         | Ultra-pristine air; filtered cleanrooms or outdoor rural settings                          | Emerald Green        | #009E60      |
+| A2        | 26 – 50              | ~0.13 – ~0.24     | Exceptionally clean; ideal for sensitive environments                                      | Forest Green         | #228B22      |
+| A3        | 51 – 75              | ~0.25 – ~0.37     | Very low VOC presence; no odour or irritation risk                                         | Leaf Green           | #32CD32      |
+| B1        | 76 – 100             | ~0.38 – ~0.49     | Excellent indoor air; optimal for all occupants                                            | Lime Green           | #BFFF00      |
+| B2        | 101 – 125            | ~0.50 – ~0.61     | Very good; minimal VOCs, no health concerns                                                | Pale Green           | #98FB98      |
+| B3        | 126 – 150            | ~0.62 – ~0.73     | Good air quality; suitable for long-term exposure                                          | Light Yellow         | #FFFFE0      |
+| C1        | 151 – 175            | ~0.74 – ~0.85     | Acceptable; low-level VOCs may be detectable by sensitive individuals                     | Yellow               | #FFFF00      |
+| C2        | 176 – 200            | ~0.86 – ~0.98     | Slightly elevated; odour possible, no health risk                                          | Amber                | #FFBF00      |
+| C3        | 201 – 225            | ~0.99 – ~1.10     | Fair; mild discomfort possible in enclosed spaces                                          | Light Orange         | #FFD580      |
+| D1        | 226 – 250            | ~1.11 – ~1.22     | Borderline moderate; ventilation may be beneficial                                         | Orange               | #FFA500      |
+| D2        | 251 – 275            | ~1.23 – ~1.34     | Moderate; symptoms possible in sensitive groups                                            | Deep Orange          | #FF8C00      |
+| D3        | 276 – 300            | ~1.35 – ~1.47     | Upper limit of “Good”; approaching warning zone                                            | Burnt Orange         | #CC5500      |
+| E1        | 301 – 400            | ~1.48 – ~1.96     | Warning zone; odours and irritation may occur                                              | Light Red            | #FF6666      |
+| E2        | 401 – 500            | ~1.97 – ~2.45     | Elevated VOCs; ventilation recommended                                                     | Red                  | #FF0000      |
+| E3        | 501 – 600            | ~2.46 – ~2.94     | Moderate pollution; complaints likely                                                      | Crimson              | #DC143C      |
+| F1        | 601 – 750            | ~2.95 – ~3.68     | Poor air quality; symptoms expected                                                        | Dark Red             | #8B0000      |
+| F2        | 751 – 1000           | ~3.69 – ~4.90     | Alert level; unsafe for prolonged exposure                                                 | Brick Red            | #B22222      |
+| G1        | 1001 – 1500          | ~4.91 – ~7.35     | High VOCs; urgent action required                                                          | Brown                | #A52A2A      |
+| G2        | 1501 – 2000          | ~7.36 – ~9.80     | Very poor; acute symptoms likely                                                           | Dark Brown           | #5C4033      |
+| G3        | 2001 – 3000          | ~9.81 – ~14.70    | Hazardous; evacuation or ventilation essential                                             | Maroon Black         | #3B0A0A      |
+| H1        | > 3000               | > ~14.70          | Severe pollution; toxic exposure risk                                                      | Black                | #000000      |
+
+---
+
+### 🍷 Ultra-Granular Ethanol Index Thresholds with Colour Coding and Hex Values
+
+| **Level** | **Ethanol Index Value** | **Description**                                                                 | **Colour Name**     | **Hex Code** |
+|-----------|--------------------------|---------------------------------------------------------------------------------|----------------------|--------------|
+| A1        | 0.00 – 0.05              | Baseline; no ethanol detected                                                  | Emerald Green        | #009E60      |
+| A2        | 0.06 – 0.10              | Trace ethanol; typical of unoccupied spaces                                    | Forest Green         | #228B22      |
+| B1        | 0.11 – 0.15              | Very low ethanol; may result from human respiration                            | Leaf Green           | #32CD32      |
+| B2        | 0.16 – 0.20              | Low ethanol; background from mild product use                                  | Pale Green           | #98FB98      |
+| C1        | 0.21 – 0.25              | Light ethanol presence; no health concern                                      | Light Yellow         | #FFFFE0      |
+| C2        | 0.26 – 0.30              | Slightly elevated; odour may be perceptible                                    | Yellow               | #FFFF00      |
+| D1        | 0.31 – 0.35              | Moderate ethanol; ventilation may be beneficial                                | Amber                | #FFBF00      |
+| D2        | 0.36 – 0.40              | Noticeable ethanol; may cause mild irritation                                  | Orange               | #FFA500      |
+| E1        | 0.41 – 0.45              | Elevated ethanol; approaching alert threshold                                  | Light Red            | #FF6666      |
+| E2        | 0.46 – 0.50              | High ethanol; alert may trigger depending on context                           | Red                  | #FF0000      |
+| F1        | 0.51 – 0.60              | Alert zone; strong ethanol presence from sprays or solvents                    | Crimson              | #DC143C      |
+| F2        | 0.61 – 0.70              | High ethanol; discomfort likely in enclosed spaces                             | Dark Red             | #8B0000      |
+| G1        | 0.71 – 0.80              | Very high ethanol; ventilation strongly advised                                | Brown                | #A52A2A      |
+| G2        | 0.81 – 0.90              | Severe ethanol spike; possible spill or misuse                                 | Dark Brown           | #5C4033      |
+| H1        | 0.91 – 1.00              | Dangerous ethanol level; flammability or toxicity risk                         | Maroon Black         | #3B0A0A      |
+| H2        | > 1.00                   | Excessive ethanol; immediate action required                                   | Black                | #000000      |
+
+---
+
+Let me know if you'd like these tables exported into a spreadsheet, embedded into a dashboard layout, or adapted for a specific sensor platform.
