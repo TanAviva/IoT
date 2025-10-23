@@ -1,0 +1,24 @@
+Here are two tables summarising the thresholds and descriptions for TVOC and ethanol index values, based on the standards and sensor practices discussed:
+
+---
+
+### **TVOC Thresholds and Air Quality Descriptions**
+
+| **Category** | **TVOC Range (ppb)** | **Approx. µg/m³** | **Air Quality Description** |
+|--------------|----------------------|-------------------|------------------------------|
+| Good         | 0 – 300              | 0 – ~1.5          | Clean indoor air; no irritation expected |
+| Moderate     | 301 – 1000           | ~1.5 – ~4.9       | Acceptable short-term exposure; mild discomfort possible |
+| Alert / Poor | > 1000               | > ~4.9            | Unhealthy air; strong odours, irritation, and health risks likely |
+
+---
+
+### **Ethanol Index Thresholds**
+
+| **Index Value** | **Description** |
+|------------------|-----------------|
+| ≤ 0.50           | Normal ethanol presence; no alert triggered |
+| > 0.50           | Elevated ethanol vapour; likely from sprays or solvents; alert triggered due to potential irritation or ventilation need |
+
+---
+
+Let me know if you'd like tables comparing thresholds across different countries or sensor brands, or if you want to explore how these thresholds are applied in building certifications like WELL or RESET.
