@@ -1,0 +1,30 @@
+Absolutely! Here's a more granular breakdown of the thresholds and descriptions for both TVOC and ethanol index values, using UK English conventions:
+
+---
+
+### **Granular TVOC Thresholds and Air Quality Descriptions**
+
+| **Category**        | **TVOC Range (ppb)** | **Approx. µg/m³** | **Air Quality Description**                                                                 |
+|---------------------|----------------------|-------------------|---------------------------------------------------------------------------------------------|
+| Excellent           | 0 – 150              | 0 – ~0.75         | Very clean indoor air; ideal for sensitive individuals; no noticeable odours or irritation |
+| Good                | 151 – 300            | ~0.75 – ~1.5      | Clean air; suitable for all occupants; minimal risk of discomfort                          |
+| Fair / Acceptable   | 301 – 600            | ~1.5 – ~2.9       | Slightly elevated VOCs; generally safe but may cause mild odour or irritation              |
+| Moderate            | 601 – 1000           | ~2.9 – ~4.9       | Noticeable VOC presence; may cause discomfort or complaints; ventilation recommended       |
+| Poor / Alert        | 1001 – 3000          | ~4.9 – ~14.7      | High VOC levels; likely to cause irritation; urgent ventilation or source control needed   |
+| Unhealthy / Severe  | > 3000               | > ~14.7           | Very high VOCs; unsafe for prolonged exposure; immediate action required                   |
+
+---
+
+### **Granular Ethanol Index Thresholds and Descriptions**
+
+| **Ethanol Index Value** | **Description**                                                                 |
+|--------------------------|---------------------------------------------------------------------------------|
+| 0.00 – 0.20              | Baseline ethanol presence; typical background levels from human activity       |
+| 0.21 – 0.50              | Mild ethanol presence; may indicate light use of sprays or cleaning products   |
+| 0.51 – 0.75              | Elevated ethanol vapour; likely from recent use of solvents or disinfectants   |
+| 0.76 – 1.00              | High ethanol concentration; potential for irritation or odour complaints       |
+| > 1.00                   | Very high ethanol levels; possible spill or overuse; ventilation strongly advised |
+
+---
+
+Let me know if you'd like a similar breakdown for formaldehyde or other specific VOCs, or if you'd like to compare these thresholds across different building standards like WELL, RESET, or LEED.
