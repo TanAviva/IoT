@@ -1,1 +1,204 @@
 ZPHS01B Multi-in-one Air Quality Monitoring Sensor Module
+
+
+Sensor Breakout Boards for VOC, Ethanol, Sulphur, Ozone, and NO₂ Detection
+Monitoring a broad range of gases (from general VOCs and odours to specific pollutants like hydrogen sulphide (H₂S), ozone (O₃), and nitrogen dioxide (NO₂)) typically requires multiple sensing technologies. No single small “universal gas sensor” can accurately detect all these substances at once – each gas may need a dedicated sensor (or at least a dedicated sensing element) due to differing chemical properties. However, there are multi-sensor breakout boards and modules that pack several gas sensors together, as well as modular systems that let you combine sensors, making it easier to build a comprehensive gas detection setup for an Arduino, Raspberry Pi, ESP32, or similar platform.
+Below, we’ll explore:
+
+All-in-one multi-gas sensor boards that integrate multiple gas sensors on one PCB (and thus one module) – including what gases they cover, how they interface, etc.
+Integrated sensor modules used in industry/HVAC that combine many sensors (like for ozone, NO₂, VOC, etc.) in one unit.
+Modular approaches: using a combination of individual sensor breakouts to achieve coverage of all the target gases (especially if one board alone doesn’t cover everything).
+
+
+<style>        :root {        --accent: #464feb;        --timeline-ln: linear-gradient(to bottom, transparent 0%, #b0beff 15%, #b0beff 85%, transparent 100%);        --timeline-border: #ffffff;        --bg-card: #f5f7fa;        --bg-hover: #ebefff;        --text-title: #424242;        --text-accent: var(--accent);        --text-sub: #424242;        --radius: 12px;        --border: #e0e0e0;        --shadow: 0 2px 10px rgba(0, 0, 0, 0.06);        --hover-shadow: 0 4px 14px rgba(39, 16, 16, 0.1);        --font: "Segoe Sans", "Segoe UI", "Segoe UI Web (West European)", -apple-system, "system-ui", Roboto, "Helvetica Neue", sans-serif;        --overflow-wrap: break-word;    }    @media (prefers-color-scheme: dark) {        :root {            --accent: #7385ff;            --timeline-ln: linear-gradient(to bottom, transparent 0%, transparent 3%, #6264a7 30%, #6264a7 50%, transparent 97%, transparent 100%);            --timeline-border: #424242;            --bg-card: #1a1a1a;            --bg-hover: #2a2a2a;            --text-title: #ffffff;            --text-sub: #ffffff;            --shadow: 0 2px 10px rgba(0, 0, 0, 0.3);            --hover-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);            --border: #3d3d3d;        }    }    @media (prefers-contrast: more),    (forced-colors: active) {        :root {            --accent: ActiveText;            --timeline-ln: ActiveText;            --timeline-border: Canvas;            --bg-card: Canvas;            --bg-hover: Canvas;            --text-title: CanvasText;            --text-sub: CanvasText;            --shadow: 0 2px 10px Canvas;            --hover-shadow: 0 4px 14px Canvas;            --border: ButtonBorder;        }    }    .insights-container {        display: grid;        grid-template-columns: repeat(2,minmax(240px,1fr));        padding: 0px 16px 0px 16px;        gap: 16px;        margin: 0 0;        font-family: var(--font);    }    .insight-card:last-child:nth-child(odd){        grid-column: 1 / -1;    }    .insight-card {        background-color: var(--bg-card);        border-radius: var(--radius);        border: 1px solid var(--border);        box-shadow: var(--shadow);        min-width: 220px;        padding: 16px 20px 16px 20px;    }    .insight-card:hover {        background-color: var(--bg-hover);    }    .insight-card h4 {        margin: 0px 0px 8px 0px;        font-size: 1.1rem;        color: var(--text-accent);        font-weight: 600;        display: flex;        align-items: center;        gap: 8px;    }    .insight-card .icon {        display: inline-flex;        align-items: center;        justify-content: center;        width: 20px;        height: 20px;        font-size: 1.1rem;        color: var(--text-accent);    }    .insight-card p {        font-size: 0.92rem;        color: var(--text-sub);        line-height: 1.5;        margin: 0px;        overflow-wrap: var(--overflow-wrap);    }    .insight-card p b, .insight-card p strong {        font-weight: 600;    }    .metrics-container {        display:grid;        grid-template-columns:repeat(2,minmax(210px,1fr));        font-family: var(--font);        padding: 0px 16px 0px 16px;        gap: 16px;    }    .metric-card:last-child:nth-child(odd){        grid-column:1 / -1;     }    .metric-card {        flex: 1 1 210px;        padding: 16px;        background-color: var(--bg-card);        border-radius: var(--radius);        border: 1px solid var(--border);        text-align: center;        display: flex;        flex-direction: column;        gap: 8px;    }    .metric-card:hover {        background-color: var(--bg-hover);    }    .metric-card h4 {        margin: 0px;        font-size: 1rem;        color: var(--text-title);        font-weight: 600;    }    .metric-card .metric-card-value {        margin: 0px;        font-size: 1.4rem;        font-weight: 600;        color: var(--text-accent);    }    .metric-card p {        font-size: 0.85rem;        color: var(--text-sub);        line-height: 1.45;        margin: 0;        overflow-wrap: var(--overflow-wrap);    }    .timeline-container {        position: relative;        margin: 0 0 0 0;        padding: 0px 16px 0px 56px;        list-style: none;        font-family: var(--font);        font-size: 0.9rem;        color: var(--text-sub);        line-height: 1.4;    }    .timeline-container::before {        content: "";        position: absolute;        top: 0;        left: calc(-40px + 56px);        width: 2px;        height: 100%;        background: var(--timeline-ln);    }    .timeline-container > li {        position: relative;        margin-bottom: 16px;        padding: 16px 20px 16px 20px;        border-radius: var(--radius);        background: var(--bg-card);        border: 1px solid var(--border);    }    .timeline-container > li:last-child {        margin-bottom: 0px;    }    .timeline-container > li:hover {        background-color: var(--bg-hover);    }    .timeline-container > li::before {        content: "";        position: absolute;        top: 18px;        left: -40px;        width: 14px;        height: 14px;        background: var(--accent);        border: var(--timeline-border) 2px solid;        border-radius: 50%;        transform: translateX(-50%);        box-shadow: 0px 0px 2px 0px #00000012, 0px 4px 8px 0px #00000014;    }    .timeline-container > li h4 {        margin: 0 0 5px;        font-size: 1rem;        font-weight: 600;        color: var(--accent);    }    .timeline-container > li h4 em {        margin: 0 0 5px;        font-size: 1rem;        font-weight: 600;        color: var(--accent);        font-style: normal;           }    .timeline-container > li * {        margin: 0;        font-size: 0.9rem;        color: var(--text-sub);        line-height: 1.4;    }    .timeline-container > li * b, .timeline-container > li * strong {        font-weight: 600;    }        @media (max-width:600px){      .metrics-container,      .insights-container{        grid-template-columns:1fr;      }    }</style><div class="insights-container">  <div class="insight-card">    <h4>Multi-Sensor Boards Exist</h4>    <p>Several breakout boards incorporate <strong>3–4 gas sensors</strong> in one package, targeting categories like CO/VOCs, NO₂ (oxidisers), and NH₃ (ammonia-like reducers). These are great for general VOC/odor monitoring but may not cover every specific gas.</p>  </div>  <div class="insight-card">    <h4>Industrial Modules Cover More</h4>    <p>Some integrated modules combine <strong>up to 8 sensors</strong> (e.g. particulate, CO₂, O₃, NO₂, CO, formaldehyde, VOC, etc.) on one board. They offer comprehensive detection (excluding H₂S) with a single UART or I²C output, ideal for HVAC or air purifiers.</p>  </div>  <div class="insight-card">    <h4>Mix-&-Match for Full Coverage</h4>    <p>You can also use <strong>multiple sensor modules together</strong> (each for a specific gas). For example, pair a VOC sensor with dedicated O₃ and H₂S sensors. Many sensor boards use I²C, allowing them to coexist on one microcontroller bus.</p>  </div></div>Show more lines
+Off-the-Shelf Multi-Gas Sensor Breakouts (3–4-in-1 Sensors)
+Several electronics manufacturers offer multi-gas sensor breakouts that combine a handful of different metal-oxide (MOX) semiconductor sensors on one board. These boards are aimed at makers and provide a single interface (like I²C) to read multiple gas signals. They are very useful for detecting VOCs, alcohols, and some inorganic gases (CO, NO₂, etc.) qualitatively. However, they often require calibration for quantitative accuracy and might not include certain gases like ozone or hydrogen sulphide.
+1. Seeed Studio Grove – Multichannel Gas Sensor v2:  This is a Grove-system I²C module that contains four independent MEMS MOX gas sensors in one package. According to Seeed, it’s sensitive to carbon monoxide (CO), nitrogen dioxide (NO₂), ethanol (C₂H₅OH, which covers “alcohol”/odour from spirits or disinfectants), and other volatile organic compounds (VOCs). Essentially, it provides four separate sensor readings. Under the hood, it uses the Winsen GM** series sensors (GM-102B, 302B, 502B, 702B) to achieve this coverage – these are small MEMS gas sensors each tuned to different gas families (NO₂, alcohol, VOC, CO respectively). Key features of the Grove Multichannel Gas Sensor v2: [wiki.seeedstudio.com]
+
+Gases covered: CO, NO₂, ethanol (as a proxy for alcohol vapours), and general VOCs/air quality index. (Other gases can be inferred qualitatively – e.g. a high ethanol sensor reading might also indicate other solvents; the NO₂ sensor may respond to ozone as well since both are oxidising gases, though it’s not calibrated for O₃ specifically.) [wiki.seeedstudio.com]
+Interface: I²C (default address 0x08) via an onboard microcontroller (STM32F0) that handles sensor reading and compensation. [wiki.seeedstudio.com]
+Power: 3.3 V or 5 V compatible. It has an onboard regulator and logic level conversion.
+Use case: Easy hookup to Arduino/ESP32 (especially using the Grove plug); provides qualitative readings of air quality. Good for detecting if “something is making the air bad” – e.g. spikes when paint, alcohol, or pollutants are present – and roughly what type of gas might be dominant (which channel reacts most).
+
+2. Pimoroni MICS6814 (3-in-1 Gas Sensor Breakout): Pimoroni (a UK maker vendor) offers a breakout built around the SGX Sensortech MiCS-6814 sensor, which contains three MOX sensors on one chip. This single chip has one sensor for oxidising gases (typically calibrated for NO₂), one for reducing gases (calibrated for CO), and one specifically for ammonia (NH₃). In practice, this means: [shop.pimoroni.com]
+
+Gases covered: The breakout is advertised for CO, NO₂, and NH₃ detection. But importantly, it’s also sensitive to other gases in those categories – “reducing gases” include not just CO but hydrogen (H₂), methane (CH₄) and other flammables; “oxidising gases” include ozone and NO₂; the NH₃ sensor likely also has some response to H₂S (another reducing gas from the ammonia family) though NH₃ is the primary target. Pimoroni notes it detects hydrogen and ethanol vapour too (on the reducing sensor). So, it covers a broad range of general odours and pollutants: [shop.pimoroni.com]
+
+CO sensor: also picks up alcohols, hydrogen, LPG, etc.
+NO₂ sensor: also responds to ozone or chlorine to some extent (any oxidising gas will change its resistance).
+NH₃ sensor: might respond to H₂S, amines, etc., though calibration is for ammonia.
+
+
+Interface: I²C (address 0x19). Pimoroni’s board actually includes a microcontroller to translate the analog resistance readings into digital values and even has a built-in RGB LED for status. This makes it plug-and-play; you don’t have to manually read analog voltages or control heater timing. [shop.pimoroni.com]
+Power: 3.3–5 V compatible, with onboard regulators and level shifting.
+Use case: Similar to the Seeed module – general indoor/outdoor air quality sensing. For instance, in an Enviro+ hat for Raspberry Pi, this sensor is used to monitor traffic pollution (NO₂) and smog (O₃/NO₂) as well as gas leaks or fumes (CO/VOC). It’s qualitative; you get relative ppm estimates but not lab-accurate numbers without calibration. Expect to use libraries or example code (Pimoroni provides a Python library) to convert the raw readings into meaningful measures. [shop.pimoroni.com]
+
+3. Other MOX Sensor Breakouts (SGP40, CCS811, etc.): There are also integrated gas sensors like Sensirion SGP30/40 and AMS CCS811/BME688. These are single-chip MOS sensors that don’t target specific gases but instead give a combined TVOC (total VOC) and/or eCO₂ (equivalent CO₂ from VOC) reading. For example, the CCS811 can detect a broad range of VOCs (it has an MOX sensor and an ADC on one chip) and output a TVOC in ppb. Similarly, the BME680/BME688 from Bosch has a MOX gas sensor plus temperature, humidity, etc., and can generate an “air quality index”. However, these are not selective – they lump all VOCs into one value and do not detect ozone, NO₂, or H₂S specifically. They’re great for indoor air quality (detecting stuffy, smelly, or polluted air in general) but since your question explicitly includes ozone and sulphur compounds, these alone would not suffice. They could be part of a multi-sensor solution (for general VOC/odour), complemented by other sensors for the specific gases.
+In summary, the off-the-shelf multi-gas boards based on MOX sensors (like the Grove and Pimoroni ones above) are excellent for prototyping broad-spectrum gas detection – they cover ethanol and common VOCs very well, and also give some coverage of NO₂ and similar pollutants. They communicate via easy digital interfaces (I²C) and run on microcontroller-friendly voltages. The downside is that ozone and hydrogen sulphide detection is not explicitly covered by these; you may get some indirect response (e.g. the NO₂ channel might spike in high ozone, the NH₃ sensor might respond to H₂S to a degree), but not with accuracy or calibration. Also, MOX sensors have significant cross-sensitivity and drift (they are better for changes and relative comparisons than absolute readings). [wiki.seeedstudio.com], [shop.pimoroni.com]
+Industrial/Integrated Modules with Multiple Sensors
+To get coverage of gases like O₃ and H₂S, often electrochemical sensors are used, which historically come as individual units. However, there are integrated modules (often intended for indoor air quality monitoring, HVAC, or portable detectors) that combine different types of sensors (electrochemical, NDIR, MOS, etc.) on one board. These tend to be larger and more expensive than the hobbyist breakouts above, but they offer a more comprehensive solution. Two notable examples:
+1. Winsen ZPHS01B “Multi-in-One” Air Quality Module: This is essentially a small air quality station on a board. It measures a whole suite of parameters:
+
+
+Gases/parameters included:
+
+Particulate Matter (PM2.5, PM10) via a laser dust sensor,
+CO₂ via an NDIR sensor,
+Formaldehyde (CH₂O) via an electrochemical sensor,
+Ozone (O₃) via an electrochemical sensor,
+Carbon Monoxide (CO) via an electrochemical sensor,
+Total VOCs via a MOX sensor,
+Nitrogen Dioxide (NO₂) via (likely) an electrochemical sensor,
+Plus temperature and humidity. [winsen-sensor.com], [winsen-sensor.com]
+
+This covers almost everything on your list except H₂S. (Formaldehyde and VOC coverage would handle many odorous organic compounds, but sulphur compounds would not be specifically measured in this module.)
+
+
+Output/interface: UART (TTL serial) with a specific protocol, streaming all the readings. The module is factory calibrated and provides concentrations for each gas (CO, NO₂, O₃, etc.) over serial. Working with it is more involved than a simple I²C sensor – you’d parse data frames from the UART. It’s powered at 5 V and draws a significant current (average <300 mA, since it’s powering a laser, IR lamp, etc.). [winsen-sensor.com]
+
+
+Use case: Air purifiers, ventilation systems, or smart home IAQ sensors. This is an all-in-one solution: if your project can accommodate its size (~13.5 × 5 cm) and power needs, one ZPHS01B gives you O₃, NO₂, VOC, CO, CO₂, PM, etc. in one package. For a stationary monitor or prototype, it’s very convenient. However, it may be overkill if you only care about a subset of those parameters. Also, it may be harder to source (Winsen is a Chinese manufacturer, and you might have to get it via an electronics distributor or Alibaba). [winsen-sensor.com], [winsen-sensor.com]
+
+
+2. Sensirion SEN55 Environmental Node: Sensirion (known for high-quality air sensors) offers the SEN5x series, of which SEN55 is the top model. It combines:
+
+PM sensor (like their SPS particulate sensor),
+MOX gas sensor array for VOCs,
+Another MOX sensor tuned for “oxidising gases (NOx)” – essentially to detect NO₂ and similar, [sensirion.com]
+Plus temperature and humidity for compensation.
+
+Notably, Sensirion doesn’t include electrochemical cells for ozone or NO₂; instead, they use a MOX sensor that reacts to the presence of NOₓ (a mix of NO₂ and maybe some ozone) and they output a calculated “NOx index”. This index is a relative scale (much like their VOC index) rather than a direct ppm of NO₂. So the SEN55 can indicate high levels of oxidising pollutants (which could be due to traffic NO₂ or ground-level ozone), but it won’t tell you explicitly “O₃ = X ppm”. [sensirion.com]
+
+Gases covered: VOC Index (which responds to things like cooking odours, solvents, etc., similar to a TVOC reading) and NOx Index (indicating presence of NO₂/ozone). It does not measure H₂S. No CO sensor on this one (CO is usually not an issue in well-ventilated environments except in fires or leaks, and is often covered by VOC sensors to an extent since CO is a reducing gas). [sensirion.com]
+Interface: I²C digital output (with several signals available: particulate counts, VOC index, NOx index, etc.). Fully calibrated and self-contained, much like their popular SGP40 or SPS30 sensors, just all in one. It runs on ~5 V and has a built-in microcontroller processing the data. [sensirion.com], [sensirion.com]
+Use case: Smart HVAC and air quality devices. It’s moderately sized (about 5 × 4 × 2 cm) and relatively easy to integrate. For prototyping, they even have an eval kit (SEK-SEN5x). If your focus is indoor air and you’re okay with “indices” instead of explicit ppm for gases, the SEN55 is an elegant solution for VOCs and NO₂. But if you need actual ozone ppm or H₂S, you’d need to add separate sensors for those.
+
+Comparison of Multi-Gas Solutions: The table below compares key features of some multi-sensor boards/modules:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Module / BoardGases Detected (targets)Sensors & TechInterface & PowerNotesSeeed Grove Gas Sensor v2CO, NO₂, Ethanol (alcohol), VOCs (general IAQ)4× MEMS MOX sensors (GM-102B, -302B, -502B, -702B)I²C (addr 0x08); 3.3–5 VQualitative; one reading per sensor [wiki.seeedstudio.com]. Onboard STM32 handles ADC & calibration. Compact Grove form-factor.Pimoroni MICS6814 BreakoutCO (and H₂, CH₄), NO₂ (and O₃), NH₃ (and maybe H₂S)3× MOX sensors in 1 chip (MiCS-6814)I²C (addr 0x19) via onboard MCU; 3–5 VQualitative; reducing vs oxidising gas readings [shop.pimoroni.com]. Also senses ethanol & other VOCs. Easy Raspberry Pi integration.Sensirion SEN55 ModuleVOC Index (for mixed VOCs), NOx Index (for NO₂/oxidants), PM2.5, T, RHMOX gas sensors + optical PM + T/RHI²C (addresses configurable); 5 VCalibrated “air quality” indices [sensirion.com]. Does not give explicit ppm for each gas. Professional accuracy; used in WELL/RESET systems.Winsen ZPHS01B ModuleCO₂, PM1/2.5/10, Formaldehyde, O₃, CO, TVOC, NO₂, Temperature, HumidityNDIR (CO₂), laser (PM), electrochemical (O₃, CO, NO₂, CH₂O), MOX (VOC), digital T/RHUART (TTL serial); 5 V (300 mA avg)Comprehensive HVAC module [winsen-sensor.com], [winsen-sensor.com]. Provides actual concentration values. Larger size (135×50×26 mm). No H₂S sensor included.
+Table: Comparison of multi-gas sensor boards/modules and their coverage.
+As shown, the multi-sensor boards cover a lot of ground: for instance, both the Seeed and Pimoroni breakouts will detect “odours” and VOCs (like paint fumes, alcohol, smoke) easily, since they are very sensitive to ethanol, toluene, CO, etc.. They also have some sensitivity to NO₂ (from vehicle exhaust or gas stoves). The more advanced modules (Sensirion, Winsen) add in things like ozone, which MOX sensors don’t explicitly measure, by using dedicated electrochemical cells or specialized MOX channels. Hydrogen sulphide (H₂S) remains a bit of an outlier – it’s not commonly included in indoor air multi-sensor units (because H₂S is more relevant to industrial settings or specific nuisance cases like sewer gas). If H₂S monitoring is needed, we likely need to add a separate sensor for that, which brings us to the next approach. [shop.pimoroni.com] [winsen-sensor.com], [sensirion.com]
+Combining Multiple Sensors for Full Coverage
+If no single board perfectly meets your requirements, you can assemble your own multi-gas system by combining several individual sensor modules, each catering to a specific gas. Many sensor breakout boards these days have a common interface (often I²C), which makes it feasible to use several at once on one microcontroller.
+For your targets – VOCs/ethanol, H₂S, O₃, NO₂ – a hybrid solution could be, for example: Use a broad-spectrum VOC sensor for general odours and VOCs, and add dedicated electrochemical sensors for O₃, NO₂, and H₂S. Here are some available sensor modules to consider:
+
+
+DFRobot “Gravity” Gas Sensor Series: DFRobot manufactures a line of electrochemical gas sensor boards that are Arduino-compatible. They have modules for Ozone (O₃), Hydrogen Sulfide (H₂S), Nitrogen Dioxide (NO₂), and many other toxic gases. Each comes with a calibrated gas sensor probe and a small adapter board that provides analog, I²C, and UART outputs. You can plug these into their “Gravity” connector system or use jumper wires. Noteworthy points: [dfrobot.com] [dfrobot.com], [dfrobot.com]
+
+They’re factory calibrated and specify a certain range (e.g. the H₂S sensor covers 0–100 ppm, the O₃ sensor 0–10 ppm with 0.01 ppm resolution). [dfrobot.com] [store.arduino.cc]
+Multiple such sensors can be used together – they even allow you to set 32 different I²C addresses on each, to avoid conflicts. DFRobot explicitly states they have 12 sensor types in this series (CO, O₂, NH₃, H₂S, NO₂, HCl, H₂, PH₃, SO₂, O₃, Cl₂, HF) and you can combine them as needed since they share the same interface and data format. [dfrobot.com], [dfrobot.com] [dfrobot.com]
+These boards typically run on 3.3–5 V and only draw a few mA each (electrochemical sensors are low-power). For example, the H₂S module uses <5 mA. [dfrobot.com]
+They output readings in ppm over I²C or UART, so it’s straightforward to parse on Arduino (DFRobot provides sample code and libraries). For instance, you could have one I²C address for the O₃ sensor and another for the H₂S sensor on the same bus, and query each in turn.
+Using DFRobot’s H₂S and O₃ sensors alongside a VOC sensor (like an SGP40 or the MOX breakout) would indeed cover all bases: the MOX handles general VOC/ethanol/odour, the H₂S sensor specifically catches sulphur odors, and the O₃ sensor measures ozone pollution.
+
+
+
+SPEC Sensors DGS Modules: SPEC Sensors (known for their miniature screen-printed electrochemical sensors) offer a Digital Gas Sensor (DGS) developer kit. The DGS2 module is essentially a small board that you can plug one of their electrochemical sensor chips into, and it provides a calibrated digital output (typically via UART/USB serial). SPEC produces tiny sensors for O₃, CO, H₂S, NO₂, ethanol (EtOH), etc., and the same DGS board can be used with any of them – you just order the version with the sensor you need (or their multi-sensor kit). They even sell a “14-pack multi-gas kit” with a variety of sensor heads that you can swap on the board. Key considerations: [spec-sensors.com]
+
+Gases covered: basically any single gas you want, as long as SPEC makes a sensor for it. For example, they have an O₃ sensor (0–20 ppm range) and an H₂S sensor, among many others. So you could buy two DGS2 modules, one with an O₃ sensor and one with H₂S, etc. (Each DGS2 only hosts one sensor at a time; it’s not a multi-sensor simultaneous board – it’s more of a one-size-fits-all platform for different sensors.)
+Interface: The DGS2 typically outputs over UART (and can come with a USB adapter for direct PC logging). For embedded use, you’d treat it as a serial device or possibly I²C (some versions might support I²C/SPI, but commonly it’s a serial stream of readings).
+Accuracy: These are high-quality sensors; SPEC’s electrochemistry is used in industrial safety devices. So expect good accuracy for the specific gas, but also a higher cost per sensor compared to MOX. The DGS modules are about $99 plus the sensor (~$50-100 depending on gas). This is more of an industrial prototyping solution.
+
+
+
+Other options (MQ series, etc.): There are many inexpensive gas sensors in the MQ series (MQ-131 is a semiconductor ozone sensor, MQ-136 for H₂S, etc.). They are analog resistive sensors that require a heater voltage and a load resistor. While very low-cost, they are not calibrated, have significant drift, and usually need dedicated ADC channels. For prototyping with Arduino, you can certainly use an MQ131 for ozone detection (it can sense ozone roughly in the parts-per-billion range), and an MQ136 for H₂S. But you would spend a lot of effort calibrating them and dealing with temperature/humidity interference. In contrast, the DFRobot and SPEC sensors mentioned above come pre-calibrated and with digital outputs, making your life easier. If budget is critical and relative detection is acceptable, MQ sensors are an option; just be aware of their limitations.
+
+
+In a combined approach, you might, for example, connect:
+
+A Sensirion SGP40 (or the VOC channel from a Grove/seeed sensor) for general VOC/odour detection,
+A DFRobot H₂S I2C sensor for sulphur smell,
+A DFRobot O₃ I2C sensor for ozone,
+(and optionally a DFRobot NO₂ sensor if you want very accurate NO₂, though your VOC/Oxidising MOX might already flag high NO₂ to an extent).
+
+This combination would give you digital readings for each target gas. The good news is all these can communicate over I²C, so wiring is not too complex – just ensure each has a unique address (the DFRobot ones allow address changes, as noted). They also all run on low voltage, so powering them from the same 3.3 V or 5 V supply is fine.
+Availability and Integration Considerations
+
+
+Availability: Modules from Seeed, Pimoroni, DFRobot, etc., are generally available through their online stores or major distributors (Mouser, Digi-Key, Sparkfun, Adafruit, etc.). For instance, the Pimoroni MICS6814 breakout (sometimes sold under PIM569) can be bought from Pimoroni or Digi-Key in the UK. Seeed’s Grove gas sensor is sold by Seeed and their distributors. DFRobot’s gas sensors can be purchased from DFRobot’s site or from Arduino’s official store (the Arduino store carries the ozone sensor, for example). The Winsen ZPHS01B is a bit more niche – you might find it via industry component suppliers or AliExpress. Sensirion’s SEN55 can be bought from Mouser/RS/Newark as it’s a formal part (SEN55-SDN-T). [store.arduino.cc]
+
+
+Integration: Many of these boards have Arduino libraries or code examples.
+
+The Grove and Pimoroni sensors have Arduino/Python libraries (since they’ve been used in popular projects, e.g., the Enviro+ library covers MICS6814).
+DFRobot provides sample code and a unified library for their I2C gas sensors (their product wiki often has Arduino code for each gas sensor).
+The Sensirion module comes with driver code and even an evaluation kit; you’d communicate via I2C to get the data.
+For the SPEC DGS, you might use a serial read in Arduino or their provided software for calibration.
+
+
+
+Power and calibration: Be mindful that MOX sensors (Grove, MICS6814, MQs) have heaters that draw more current (typically ~30-60 mA each heater). Ensure your 3.3 V/5 V regulator can supply a few hundred mA if using several MOX sensors simultaneously. Electrochemical sensors (DFRobot, SPEC) are low-power but have a limited lifespan (usually ~2 years) once exposed, as the chemical reaction sites eventually deplete. They also generally require a warm-up time (a few minutes) each time powered on to stabilize. [dfrobot.com], [dfrobot.com]
+
+MOX sensors also need a burn-in period when first used (e.g., 24-48 hours) to stabilize readings, and their resistance in clean air can drift over time. It’s good to include a calibration or self-correction mechanism if you want long-term accuracy (some advanced modules like the SEN55 do this automatically with algorithms).
+
+
+
+Combination pitfalls: Using many sensors together can sometimes introduce cross-interference. For example, running a hydrogen sulphide electrochemical sensor in proximity to an ethanol-burning MOX sensor shouldn’t pose a direct problem, but be cautious of things like the heat from MOX sensors potentially altering readings of nearby electrochemical sensors (due to temperature shifts). In practice this is usually minor, but if you box everything together, try to allow airflow and perhaps physically separate high-heat sensors from others. The Sensirion SEN55 neatly avoids that by combining them with proper isolation and compensation on one board – a DIY combo might need a bit of testing and calibration in the actual environment.
+
+
+In Conclusion
+It is possible to detect VOCs, ethanol, odorous gases, sulphur compounds, ozone, and NO₂ all at once, but typically not with a single chip. Your best bet is either:
+
+an integrated multi-sensor module (like the Grove Multichannel sensor for a partial set, or an industrial module like ZPHS01B for a comprehensive set except H₂S), or
+a custom array of sensors combined in one device (e.g. a MOX VOC sensor + O₃ electrochemical + H₂S electrochemical + NO₂ electrochemical).
+
+For prototyping on Arduino/RPi, many engineers choose the latter for flexibility – for example, pairing a BME680 (for VOCs) with an MQ131 (for ozone) and an MQ136 (for H₂S) if on a tight budget, or the DFRobot calibrated modules for ease of use. The specific path depends on factors like budget, required accuracy, power consumption, and how much you want to avoid manual calibration.
+Given the options, a practical approach would be:
+
+Start with a multi-gas MOX board (like the MICS6814 or Grove). This gives you immediate data on VOC/ethanol and some indication of NO₂/ozone in a simple way.
+Add a dedicated O₃ sensor if you need precise ozone measurements (e.g. the gravity Ozone I2C sensor for 0–10 ppm O₃). [store.arduino.cc]
+Add a H₂S sensor to cover sulphur odors (e.g. the gravity H₂S I2C sensor, 0–100 ppm). [dfrobot.com]
+You’ll then have coverage of: general VOCs/ethanol (MOX), CO (MOX), NO₂ (MOX and the NO₂ electrochemical if you choose to add one), O₃ (electrochemical), H₂S (electrochemical).
+
+All these can indeed be interfaced on one microcontroller. For instance, an ESP32 has multiple I²C buses – you could put the MOX board on one and multiple DFRobot sensors on another bus to avoid address conflicts or simply change the addresses as needed.
+By prioritising sensors from reputable manufacturers and looking at their datasheets or product wikis, you’ll also find useful reference material and even Arduino code to speed up development. The sensor landscape is always improving, so new integrated solutions might emerge (for example, Bosch is working on MOX arrays that could potentially classify multiple gases with AI software – the BME688 can be trained to recognise specific “smells”, but that’s a more complex, experimental route).
+For now, the combination of a multi-sensor MOX breakout plus a couple of targeted gas sensor modules is a reliable way to achieve broad-spectrum gas detection in one project.
+Sources:
+
+Seeed Studio – Grove Multichannel Gas Sensor v2 product description (gas coverage and features) [wiki.seeedstudio.com]
+Pimoroni – MICS6814 3-in-1 Gas Sensor Breakout details (detectable gases and sensitivity) [shop.pimoroni.com]
+Winsen – ZPHS01B multi-in-one module datasheet (integrated sensors and specs) [winsen-sensor.com], [winsen-sensor.com]
+Sensirion – SEN55 environmental sensor node brochure (VOC and NOx multi-sensor platform) [sensirion.com]
+DFRobot – Gravity Ozone Sensor (SKU SEN0321) specs and Gravity H₂S Sensor (SKU SEN0467) specs (range, interface, usage) [store.arduino.cc] [dfrobot.com]
+DFRobot documentation – note on combining their gas sensor series (multiple sensors with identical interface/protocol) [dfrobot.com]
+SPEC Sensors – DGS2 module info and product catalog (support for interchangeable sensors: O₃, H₂S, NO₂, EtOH, etc.) [spec-sensors.com]
+Arduino forums and tutorials – e.g., use of MQ131 for ozone (as an example of low-cost sensor usage).
