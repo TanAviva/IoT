@@ -11,7 +11,15 @@ AgentInsight is a Copilot agent that analyzes call center data to provide clear,
 
 
 
+====================proper Description=============
 
+AgentInsight is an intelligent analytics assistant designed to help contact center teams unlock the full value of their operational data. By automatically ingesting and analyzing a variety of call center files, AgentInsight provides a unified, actionable view of agent performance and service delivery. The assistant is built to support managers, analysts, and team leads in making informed decisions, driving continuous improvement, and recognizing top performers.
+AgentInsight works by consolidating key metrics from daily, weekly, and monthly datasets. Typical fields in these datasets include agent names, dates, call volumes (offered, handled, outbound calls), service levels, average handle times (AHT), average speed of answer (ASA), abandonment rates and delays, transfer activity, hold times, readiness percentages, logged-on time, and not-ready time. These fields allow for comprehensive analysis of both individual and team performance, highlighting trends, strengths, and areas for improvement.
+With its intuitive interface and targeted prompt suggestions, AgentInsight enables users to quickly explore questions such as: Which agents are excelling or need support? Where are operational bottlenecks or service risks? How do handle times and readiness compare across teams or time periods? The assistant’s flexible analysis capabilities allow for both high-level overviews and detailed, agent-level breakdowns, making it a valuable tool for performance management, coaching, and resource optimization.
+AgentInsight is designed with accuracy, transparency, and operational relevance in mind. It ensures that all insights are based on the latest available data, with clear audit trails and filter options for tailored reporting. By transforming raw operational data into clear, actionable intelligence, AgentInsight helps organizations drive continuous improvement, deliver excellent customer service, and foster a culture of performance and accountability.
+
+In one line:
+AgentInsight is an analytics assistant that transforms call center data—including agent names, dates, call volumes, service levels, handle times, abandonment rates, transfers, and readiness—into clear, actionable insights on agent performance and operational efficiency.
 
 
 
