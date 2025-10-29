@@ -41,8 +41,7 @@ This SharePoint drive is a secure, collaborative workspace for the Aviva Ireland
 
 =======================how can the files be transfeered automatiaclly from a remote directory as shown in the image to  SharePoint document library?============
 
-he image shows a remote network directory (likely a shared drive or mapped network folder) containing operational Excel files for call center reporting. The directory path is:
-Network > IEHIBGC1 > IrlQIDta$ > Qlik_Sense_Datasets > 2. Direct Stream > GCC CUIC > Call Type
+he image shows a remote network directory (likely a shared drive or mapped network folder) containing operational Excel files for call center reporting.
 
 This location is used to store daily and historical call center data files, such as Excel workbooks named by date, merged datasets, and folders for historical and consolidated reports.
 
