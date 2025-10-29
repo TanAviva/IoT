@@ -1,3 +1,33 @@
+Paragraph Description:
+AgentInsight interface, a specialized Copilot agent designed to analyze call center agent data and deliver actionable performance insights. 
+The dashboard features a clean layout with suggested prompts that guide users to explore agent performance, operational initiatives, team collaboration, agent profiles, service quality feedback, and agent support. 
+By leveraging uploaded call center files, AgentInsight enables teams to identify trends, benchmark service quality, and uncover opportunities for operational improvement, all through intuitive, targeted queries
+
+
+
+One-line Description:
+AgentInsight is a Copilot agent that analyzes call center data to provide clear, actionable insights on agent performance and operational effectiveness.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+===========================================
 Developed AgentInsight using copilot agents to analyse Call centre 
 
 AgentInsight is an AI-powered Copilot agent that analyzes call center agent performance data, providing actionable insights on productivity, handle times, and call outcomes. 
