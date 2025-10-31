@@ -1,0 +1,36 @@
+To need to install Visual c++ build tools, just get DNS blockage removed:
+
+conda create -n old-dedupe python=3.10
+
+conda activate old-dedupe
+
+(old-dedupe) C:\Users\Tanlocal> pip install dedupe==1.10.0
+
+=============
+
+conda deactivate
+
+
+=========
+
+Option 2: If You Must Use dedupe==1.10.0
+If you are working on an old project and you absolutely must have version 1.10.0, you cannot use it with Python 3.12. You must use an older version of Python.
+
+The best way to do this is with a new Conda environment.
+
+Create a new environment with an older Python (e.g., Python 3.10):
+
+Bash
+
+conda create -n old-dedupe python=3.10
+Activate the new environment:
+
+Bash
+
+conda activate old-dedupe
+Install the old version inside this new environment (where Python is 3.10):
+
+Bash
+
+(old-dedupe) C:\Users\Tanlocal> pip install dedupe==1.10.0
+This will work because Python 3.10 still has the longintrepr.h file that dedupe==1.10.0 needs.
